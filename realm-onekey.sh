@@ -1,7 +1,20 @@
 #!/bin/bash
 
+# 定义脚本版本
+SCRIPT_VERSION="20241008.1"
+
 # 定义 realm 版本变量
 REALM_VERSION="v2.6.2"
+
+# 获取本地 realm 版本
+get_local_realm_version() {
+    if [ -f "/root/realm/realm" ]; then
+        local_version=$(/root/realm/realm --version | awk '{print $2}')
+        echo "v$local_version"
+    else
+        echo "未安装"
+    fi
+}
 
 # 检查realm是否已安装
 if [ -f "/root/realm/realm" ]; then
@@ -26,7 +39,7 @@ check_realm_service_status() {
 # 显示菜单的函数
 show_menu() {
     clear
-    echo "欢迎使用 realm 一键转发脚本"
+    echo "欢迎使用 realm 管理脚本 (v$SCRIPT_VERSION)"
     echo "================="
     echo "1. 部署环境"
     echo "2. 添加转发"
@@ -34,9 +47,11 @@ show_menu() {
     echo "4. 启动服务"
     echo "5. 停止服务"
     echo "6. 一键卸载"
+    echo "7. 升级 realm"
     echo "0. 退出脚本"
     echo "================="
     echo -e "realm 状态：${realm_status_color}${realm_status}\033[0m"
+    echo -e "realm 版本：$(get_local_realm_version)"
     echo -n "realm 转发状态："
     check_realm_service_status
 }
@@ -65,7 +80,9 @@ deploy_realm() {
     cd /root/realm
     wget -O realm.tar.gz https://github.com/zhboner/realm/releases/download/${REALM_VERSION}/realm-x86_64-unknown-linux-gnu.tar.gz
     tar -xvf realm.tar.gz
-    chmod +x realm
+    mv realm realm-${REALM_VERSION#v}
+    ln -sf realm-${REALM_VERSION#v} realm
+    chmod +x realm-${REALM_VERSION#v}
 
     # 生成基本配置文件
     generate_config
@@ -232,6 +249,40 @@ stop_service() {
     echo "realm 服务已停止。"
 }
 
+# 升级 realm 的函数
+upgrade_realm() {
+    local current_version=$(get_local_realm_version)
+    if [ "$current_version" == "未安装" ]; then
+        echo "realm 未安装，请先安装。"
+        return
+    fi
+
+    echo "当前版本: $current_version"
+    echo "最新版本: $REALM_VERSION"
+
+    if [ "$current_version" == "$REALM_VERSION" ]; then
+        echo "已经是最新版本，无需升级。"
+        return
+    fi
+
+    read -p "是否升级到 $REALM_VERSION? (y/N): " confirm
+    if [[ $confirm != [Yy] ]]; then
+        echo "取消升级。"
+        return
+    fi
+
+    cd /root/realm
+    wget -O realm.tar.gz https://github.com/zhboner/realm/releases/download/${REALM_VERSION}/realm-x86_64-unknown-linux-gnu.tar.gz
+    tar -xvf realm.tar.gz
+    mv realm realm-${REALM_VERSION#v}
+    ln -sf realm-${REALM_VERSION#v} realm
+    chmod +x realm-${REALM_VERSION#v}
+
+    echo "realm 已升级到 $REALM_VERSION"
+    systemctl restart realm
+    echo "realm 服务已重启。"
+}
+
 # 主循环
 while true; do
     show_menu
@@ -254,6 +305,9 @@ while true; do
             ;;
         6)
             uninstall_realm
+            ;;
+        7)
+            upgrade_realm
             ;;
         0)
             exit 0

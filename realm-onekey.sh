@@ -34,6 +34,7 @@ show_menu() {
     echo "4. 启动服务"
     echo "5. 停止服务"
     echo "6. 一键卸载"
+    echo "0. 退出脚本"
     echo "================="
     echo -e "realm 状态：${realm_status_color}${realm_status}\033[0m"
     echo -n "realm 转发状态："
@@ -45,7 +46,7 @@ generate_config() {
     cat > /root/realm/config.toml << EOF
 [log]
 level = "warn"
-output = "/root/realm/realm.log"
+output = "stdout"
 
 [network]
 no_tcp = false
@@ -253,6 +254,9 @@ while true; do
             ;;
         6)
             uninstall_realm
+            ;;
+        0)
+            exit 0
             ;;
         *)
             echo "无效选项: $choice"

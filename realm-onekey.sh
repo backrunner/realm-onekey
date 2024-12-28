@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 定义脚本版本
-SCRIPT_VERSION="20241008.1"
+SCRIPT_VERSION="20241228"
 
 # 定义 realm 版本变量
 REALM_VERSION="v2.6.2"
@@ -36,24 +36,67 @@ check_realm_service_status() {
     fi
 }
 
-# 显示菜单的函数
-show_menu() {
+# 显示主菜单
+show_main_menu() {
     clear
     echo "欢迎使用 realm 管理脚本 (v$SCRIPT_VERSION)"
     echo "================="
-    echo "1. 部署环境"
-    echo "2. 添加转发"
-    echo "3. 删除转发"
-    echo "4. 启动服务"
-    echo "5. 停止服务"
-    echo "6. 一键卸载"
-    echo "7. 升级 realm"
+    echo "1. 服务管理"
+    echo "2. 转发管理"
+    echo "3. 系统维护"
     echo "0. 退出脚本"
     echo "================="
     echo -e "realm 状态：${realm_status_color}${realm_status}\033[0m"
     echo -e "realm 版本：$(get_local_realm_version)"
     echo -n "realm 转发状态："
     check_realm_service_status
+}
+
+# 显示服务管理菜单
+show_service_menu() {
+    clear
+    echo "realm 服务管理"
+    echo "================="
+    echo "1. 启动服务"
+    echo "2. 停止服务"
+    echo "3. 查看配置文件"
+    echo "0. 返回主菜单"
+    echo "================="
+}
+
+# 显示转发管理菜单
+show_forward_menu() {
+    clear
+    echo "realm 转发管理"
+    echo "================="
+    echo "1. 添加转发"
+    echo "2. 删除转发"
+    echo "0. 返回主菜单"
+    echo "================="
+}
+
+# 显示系统维护菜单
+show_maintenance_menu() {
+    clear
+    echo "realm 系统维护"
+    echo "================="
+    echo "1. 部署 realm"
+    echo "2. 升级 realm"
+    echo "3. 卸载 realm"
+    echo "0. 返回主菜单"
+    echo "================="
+}
+
+# 查看配置文件内容
+show_config() {
+    if [ -f "/root/realm/config.toml" ]; then
+        echo "当前配置文件内容："
+        echo "==================="
+        cat /root/realm/config.toml
+        echo "==================="
+    else
+        echo "配置文件不存在！"
+    fi
 }
 
 # 生成基本配置文件的函数
@@ -285,29 +328,49 @@ upgrade_realm() {
 
 # 主循环
 while true; do
-    show_menu
+    show_main_menu
     read -p "请选择一个选项: " choice
     case $choice in
-        1)
-            deploy_realm
+        1)  # 服务管理
+            while true; do
+                show_service_menu
+                read -p "请选择一个选项: " service_choice
+                case $service_choice in
+                    1) start_service ;;
+                    2) stop_service ;;
+                    3) show_config ;;
+                    0) break ;;
+                    *) echo "无效选项: $service_choice" ;;
+                esac
+                read -p "按任意键继续..." key
+            done
             ;;
-        2)
-            add_forward
+        2)  # 转发管理
+            while true; do
+                show_forward_menu
+                read -p "请选择一个选项: " forward_choice
+                case $forward_choice in
+                    1) add_forward ;;
+                    2) delete_forward ;;
+                    0) break ;;
+                    *) echo "无效选项: $forward_choice" ;;
+                esac
+                read -p "按任意键继续..." key
+            done
             ;;
-        3)
-            delete_forward
-            ;;
-        4)
-            start_service
-            ;;
-        5)
-            stop_service
-            ;;
-        6)
-            uninstall_realm
-            ;;
-        7)
-            upgrade_realm
+        3)  # 系统维护
+            while true; do
+                show_maintenance_menu
+                read -p "请选择一个选项: " maintenance_choice
+                case $maintenance_choice in
+                    1) deploy_realm ;;
+                    2) upgrade_realm ;;
+                    3) uninstall_realm ;;
+                    0) break ;;
+                    *) echo "无效选项: $maintenance_choice" ;;
+                esac
+                read -p "按任意键继续..." key
+            done
             ;;
         0)
             exit 0
@@ -316,5 +379,4 @@ while true; do
             echo "无效选项: $choice"
             ;;
     esac
-    read -p "按任意键继续..." key
 done

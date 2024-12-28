@@ -315,11 +315,26 @@ upgrade_realm() {
     fi
 
     cd /root/realm
+    # 停止服务
+    systemctl stop realm
+
+    # 备份当前配置文件
+    cp config.toml config.toml.backup
+
+    # 删除旧版本文件
+    rm -f realm.tar.gz
+    rm -f realm  # 删除软链接
+    rm -f realm-*  # 删除所有旧版本
+
+    # 下载并安装新版本
     wget -O realm.tar.gz https://github.com/zhboner/realm/releases/download/${REALM_VERSION}/realm-x86_64-unknown-linux-gnu.tar.gz
     tar -xvf realm.tar.gz
     mv realm realm-${REALM_VERSION#v}
     ln -sf realm-${REALM_VERSION#v} realm
     chmod +x realm-${REALM_VERSION#v}
+
+    # 恢复配置文件
+    mv config.toml.backup config.toml
 
     echo "realm 已升级到 $REALM_VERSION"
     systemctl restart realm

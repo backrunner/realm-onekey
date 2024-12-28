@@ -4,7 +4,7 @@
 SCRIPT_VERSION="20241228"
 
 # 定义 realm 版本变量
-REALM_VERSION="v2.6.2"
+REALM_VERSION="v2.7.0"
 
 # 获取本地 realm 版本
 get_local_realm_version() {

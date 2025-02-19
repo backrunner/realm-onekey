@@ -1,31 +1,244 @@
 #!/bin/bash
+# -*- coding: utf-8 -*-
+
+# 定义颜色
+COLOR_RED="\033[0;31m"
+COLOR_GREEN="\033[0;32m"
+COLOR_YELLOW="\033[0;33m"
+COLOR_BLUE="\033[0;34m"
+COLOR_PURPLE="\033[0;35m"
+COLOR_CYAN="\033[0;36m"
+COLOR_RESET="\033[0m"
+
+# 在颜色定义后添加发行版检测相关变量和函数
+# 定义支持的发行版类型
+DISTRO_TYPE=""
+PKG_MANAGER=""
+PKG_UPDATE=""
+PKG_INSTALL=""
+
+# 检测发行版类型
+detect_distro() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            "debian"|"ubuntu"|"linuxmint"|"pop"|"elementary"|"zorin")
+                DISTRO_TYPE="debian"
+                PKG_MANAGER="apt-get"
+                PKG_UPDATE="apt-get update"
+                PKG_INSTALL="apt-get install -y"
+                ;;
+            "centos"|"rhel"|"fedora"|"rocky"|"almalinux"|"ol")
+                DISTRO_TYPE="rhel"
+                if command -v dnf >/dev/null 2>&1; then
+                    PKG_MANAGER="dnf"
+                    PKG_UPDATE="dnf check-update"
+                    PKG_INSTALL="dnf install -y"
+                else
+                    PKG_MANAGER="yum"
+                    PKG_UPDATE="yum check-update"
+                    PKG_INSTALL="yum install -y"
+                fi
+                ;;
+            "opensuse-leap"|"opensuse-tumbleweed"|"sles")
+                DISTRO_TYPE="suse"
+                PKG_MANAGER="zypper"
+                PKG_UPDATE="zypper refresh"
+                PKG_INSTALL="zypper install -y"
+                ;;
+            "arch"|"manjaro"|"endeavouros")
+                DISTRO_TYPE="arch"
+                PKG_MANAGER="pacman"
+                PKG_UPDATE="pacman -Sy"
+                PKG_INSTALL="pacman -S --noconfirm"
+                ;;
+            *)
+                echo -e "${COLOR_RED}不支持的发行版：$ID${COLOR_RESET}"
+                exit 1
+                ;;
+        esac
+    else
+        echo -e "${COLOR_RED}无法检测到系统发行版信息${COLOR_RESET}"
+        exit 1
+    fi
+}
+
+# 安装依赖包
+install_dependencies() {
+    echo -e "${COLOR_BLUE}正在安装必要的依赖...${COLOR_RESET}"
+
+    # 检查 wget 是否已安装
+    if ! command -v wget >/dev/null 2>&1; then
+        echo -e "${COLOR_YELLOW}检测到系统未安装 wget，正在安装...${COLOR_RESET}"
+        # 更新包管理器
+        $PKG_UPDATE >/dev/null 2>&1
+
+        case $DISTRO_TYPE in
+            "debian")
+                $PKG_INSTALL wget >/dev/null 2>&1
+                ;;
+            "rhel")
+                $PKG_INSTALL wget >/dev/null 2>&1
+                ;;
+            "suse")
+                $PKG_INSTALL wget >/dev/null 2>&1
+                ;;
+            "arch")
+                $PKG_INSTALL wget >/dev/null 2>&1
+                ;;
+        esac
+
+        if ! command -v wget >/dev/null 2>&1; then
+            echo -e "${COLOR_RED}wget 安装失败，请手动安装后重试${COLOR_RESET}"
+            exit 1
+        fi
+        echo -e "${COLOR_GREEN}wget 安装完成${COLOR_RESET}"
+    fi
+
+    # 定义基础依赖包（移除 wget，因为已经单独处理）
+    local base_packages="curl tar"
+
+    # 根据不同发行版安装特定依赖
+    case $DISTRO_TYPE in
+        "debian")
+            $PKG_INSTALL $base_packages systemd >/dev/null 2>&1
+            ;;
+        "rhel")
+            $PKG_INSTALL $base_packages systemd epel-release >/dev/null 2>&1
+            ;;
+        "suse")
+            $PKG_INSTALL $base_packages systemd >/dev/null 2>&1
+            ;;
+        "arch")
+            $PKG_INSTALL $base_packages systemd >/dev/null 2>&1
+            ;;
+    esac
+
+    if [ $? -eq 0 ]; then
+        echo -e "${COLOR_GREEN}依赖安装完成${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}依赖安装失败${COLOR_RESET}"
+        exit 1
+    fi
+}
+
+echo -e "\033%G"  # 设置终端字符集
 
 # 定义脚本版本
-SCRIPT_VERSION="20241228"
+SCRIPT_VERSION="20250220"
 
 # 定义 realm 版本变量
-REALM_VERSION="v2.7.0"
+REALM_VERSION="v2.7.0"  # 预设版本
+LATEST_VERSION=""       # 用于存储从 GitHub 获取的最新版本
+GITHUB_TIMEOUT=5       # GitHub API 请求超时时间（秒）
+
+# 定义基础目录（在脚本最前面添加）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REALM_DIR="${SCRIPT_DIR}/realm"
+
+# 初始化状态变量
+realm_status="未知"
+realm_status_color="\033[0;31m" # 默认红色
+
+# 首先定义 wait_key 函数（放在文件前面的函数定义部分）
+wait_key() {
+    read -r -p "按回车键继续..."
+}
+
+# 检查是否已经创建了快捷方式
+check_and_create_shortcut() {
+    local shortcut_name="realm-manager"
+    local shortcut_path="/usr/local/bin/${shortcut_name}"
+    local flag_file="${SCRIPT_DIR}/.no_shortcut"
+
+    # 如果存在标记文件或已经创建了快捷方式，则不询问
+    if [ -f "$flag_file" ] || [ -f "$shortcut_path" ]; then
+        return
+    fi
+
+    echo -e "${COLOR_YELLOW}检测到未创建快捷方式。${COLOR_RESET}"
+    read -r -p "是否创建 'realm-manager' 命令快捷方式？(y/N): " create_shortcut
+    if [[ $create_shortcut == [Yy] ]]; then
+        create_shortcut_internal
+    else
+        # 创建标记文件表示用户选择不创建快捷方式
+        touch "$flag_file"
+    fi
+    echo
+    sleep 1
+}
+
+# 添加创建快捷方式的内部函数
+create_shortcut_internal() {
+    local shortcut_name="realm-manager"
+    local shortcut_path="/usr/local/bin/${shortcut_name}"
+    local script_path=$(readlink -f "$0")
+
+    if sudo ln -sf "$script_path" "$shortcut_path"; then
+        sudo chmod +x "$shortcut_path"
+        echo -e "${COLOR_GREEN}快捷方式已创建！现在可以使用 'realm-manager' 命令来启动管理脚本。${COLOR_RESET}"
+        # 如果存在不创建快捷方式的标记文件，删除它
+        rm -f "${SCRIPT_DIR}/.no_shortcut"
+    else
+        echo -e "${COLOR_RED}快捷方式创建失败！${COLOR_RESET}"
+    fi
+}
+
+# 添加删除快捷方式的函数
+remove_shortcut() {
+    local shortcut_name="realm-manager"
+    local shortcut_path="/usr/local/bin/${shortcut_name}"
+
+    if [ -f "$shortcut_path" ]; then
+        if sudo rm -f "$shortcut_path"; then
+            echo -e "${COLOR_GREEN}快捷方式已删除${COLOR_RESET}"
+            # 创建标记文件表示用户主动删除了快捷方式
+            touch "${SCRIPT_DIR}/.no_shortcut"
+        else
+            echo -e "${COLOR_RED}删除快捷方式失败${COLOR_RESET}"
+        fi
+    else
+        echo -e "${COLOR_YELLOW}快捷方式不存在${COLOR_RESET}"
+    fi
+    sleep 1
+}
 
 # 获取本地 realm 版本
 get_local_realm_version() {
-    if [ -f "/root/realm/realm" ]; then
-        local_version=$(/root/realm/realm --version | awk '{print $2}')
-        echo "v$local_version"
+    if [ -f "${REALM_DIR}/realm" ]; then
+        # 首先尝试从可执行文件名获取版本
+        local executable_version=""
+        if [ -L "${REALM_DIR}/realm" ]; then
+            # 获取软链接指向的实际文件名
+            local target_file=$(readlink "${REALM_DIR}/realm")
+            # 尝试从文件名中提取版本号
+            if [[ $target_file =~ realm-([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+                executable_version="v${BASH_REMATCH[1]}"
+            fi
+        fi
+
+        # 如果从文件名无法获取版本，或版本号大于定义的版本，则使用 --version 命令
+        if [ -z "$executable_version" ] || [ "$(printf '%s\n' "$REALM_VERSION" "$executable_version" | sort -V | head -n1)" != "$REALM_VERSION" ]; then
+            local cmd_version=$("${REALM_DIR}/realm" --version | awk '{print $2}')
+            echo "v$cmd_version"
+        else
+            echo "$executable_version"
+        fi
     else
         echo "未安装"
     fi
 }
 
-# 检查realm是否已安装
-if [ -f "/root/realm/realm" ]; then
-    echo "检测到 realm 已安装。"
-    realm_status="已安装"
-    realm_status_color="\033[0;32m" # 绿色
-else
-    echo "realm 未安装。"
-    realm_status="未安装"
-    realm_status_color="\033[0;31m" # 红色
-fi
+# 检查realm状态的函数
+check_realm_status() {
+    if [ -f "${REALM_DIR}/realm" ]; then
+        realm_status="已安装"
+        realm_status_color="\033[0;32m" # 绿色
+    else
+        realm_status="未安装"
+        realm_status_color="\033[0;31m" # 红色
+    fi
+}
 
 # 检查realm服务状态
 check_realm_service_status() {
@@ -36,7 +249,30 @@ check_realm_service_status() {
     fi
 }
 
-# 显示主菜单
+# 修改获取最新版本的函数
+get_latest_version() {
+    # 如果已经获取过版本，直接返回
+    if [ ! -z "$LATEST_VERSION" ]; then
+        echo "$LATEST_VERSION"
+        return
+    fi
+    return 1  # 如果没有预先获取版本，返回错误
+}
+
+# 修改初始化获取版本的函数
+init_latest_version() {
+    # 使用超时参数获取最新版本
+    local latest=$(curl -s -m $GITHUB_TIMEOUT "https://api.github.com/repos/zhboner/realm/releases/latest" | grep -oP '"tag_name": "\K[^"]+')
+    if [ $? -eq 0 ] && [ ! -z "$latest" ]; then
+        LATEST_VERSION="$latest"
+    else
+        LATEST_VERSION="$REALM_VERSION"
+        echo -e "${COLOR_YELLOW}获取最新版本失败${COLOR_RESET}"
+        sleep 1
+    fi
+}
+
+# 修改主菜单显示函数
 show_main_menu() {
     clear
     echo "欢迎使用 realm 管理脚本 (v$SCRIPT_VERSION)"
@@ -47,35 +283,37 @@ show_main_menu() {
     echo "0. 退出脚本"
     echo "================="
     echo -e "realm 状态：${realm_status_color}${realm_status}\033[0m"
-    echo -e "realm 版本：$(get_local_realm_version)"
+    echo -e "realm 当前版本：$(get_local_realm_version)"
+    echo -e "realm 最新版本：$(get_latest_version || echo "$REALM_VERSION")"
     echo -n "realm 转发状态："
     check_realm_service_status
 }
 
-# 显示服务管理菜单
+# 修改菜单显示函数，移除内部的输入处理
 show_service_menu() {
     clear
     echo "realm 服务管理"
     echo "================="
     echo "1. 启动服务"
     echo "2. 停止服务"
-    echo "3. 查看配置文件"
+    echo "3. 重启服务"
+    echo "4. 查看配置文件"
     echo "0. 返回主菜单"
     echo "================="
 }
 
-# 显示转发管理菜单
 show_forward_menu() {
     clear
     echo "realm 转发管理"
     echo "================="
     echo "1. 添加转发"
     echo "2. 删除转发"
+    echo "3. 修改转发"
+    echo "4. 列出转发"
     echo "0. 返回主菜单"
     echo "================="
 }
 
-# 显示系统维护菜单
 show_maintenance_menu() {
     clear
     echo "realm 系统维护"
@@ -83,16 +321,21 @@ show_maintenance_menu() {
     echo "1. 部署 realm"
     echo "2. 升级 realm"
     echo "3. 卸载 realm"
+    if [ -f "/usr/local/bin/realm-manager" ]; then
+        echo "4. 删除快捷方式"
+    else
+        echo "4. 创建快捷方式"
+    fi
     echo "0. 返回主菜单"
     echo "================="
 }
 
 # 查看配置文件内容
 show_config() {
-    if [ -f "/root/realm/config.toml" ]; then
+    if [ -f "${REALM_DIR}/config.toml" ]; then
         echo "当前配置文件内容："
         echo "==================="
-        cat /root/realm/config.toml
+        cat "${REALM_DIR}/config.toml"
         echo "==================="
     else
         echo "配置文件不存在！"
@@ -101,7 +344,7 @@ show_config() {
 
 # 生成基本配置文件的函数
 generate_config() {
-    cat > /root/realm/config.toml << EOF
+    cat > "${REALM_DIR}/config.toml" << EOF
 [log]
 level = "warn"
 output = "stdout"
@@ -114,33 +357,62 @@ use_udp = true
 
 # 转发规则将在此处添加
 EOF
-    echo "基础配置文件已生成：/root/realm/config.toml"
+    echo "基础配置文件已生成：${REALM_DIR}/config.toml"
 }
 
-# 部署环境的函数
+# 修改部署函数中的版本使用
 deploy_realm() {
-    mkdir -p /root/realm
-    cd /root/realm
-    wget -O realm.tar.gz https://github.com/zhboner/realm/releases/download/${REALM_VERSION}/realm-x86_64-unknown-linux-gnu.tar.gz
+    # 获取最新版本
+    local deploy_version=$(get_latest_version || echo "$REALM_VERSION")
+
+    # 检测并安装依赖
+    install_dependencies
+
+    # 创建目录并下载 realm
+    mkdir -p "${REALM_DIR}"
+    cd "${REALM_DIR}"
+
+    echo -e "${COLOR_BLUE}下载 realm ${deploy_version}...${COLOR_RESET}"
+    if ! wget -O realm.tar.gz "https://github.com/zhboner/realm/releases/download/${deploy_version}/realm-x86_64-unknown-linux-gnu.tar.gz"; then
+        echo -e "${COLOR_RED}下载失败${COLOR_RESET}"
+        return 1
+    fi
+
     tar -xvf realm.tar.gz
-    mv realm realm-${REALM_VERSION#v}
-    ln -sf realm-${REALM_VERSION#v} realm
-    chmod +x realm-${REALM_VERSION#v}
+    mv realm realm-${deploy_version#v}
+    ln -sf realm-${deploy_version#v} realm
+    chmod +x realm-${deploy_version#v}
+
+    # 更新预设版本为最新版本
+    REALM_VERSION="$deploy_version"
 
     # 生成基本配置文件
     generate_config
 
     # 询问用户是否使用自定义 DNS
-    read -p "是否使用自定义 DNS 服务器? (y/N): " use_custom_dns
+    use_custom_dns=$(read_input "是否使用自定义 DNS 服务器? (y/N): ")
     if [[ $use_custom_dns == "Y" || $use_custom_dns == "y" ]]; then
-        read -p "请输入 DNS 服务器地址 (多个地址用逗号分隔): " custom_dns
-        sed -i '/# DNS 配置将在此处添加/c\[dns]\nnameservers = [\"'${custom_dns//,/\", \"}'\"]' /root/realm/config.toml
+        custom_dns=$(read_input "请输入 DNS 服务器地址 (多个地址用逗号分隔): ")
+        sed -i '/# DNS 配置将在此处添加/c\[dns]\nnameservers = [\"'${custom_dns//,/\", \"}'\"]' "${REALM_DIR}/config.toml"
     else
-        sed -i '/# DNS 配置将在此处添加/c\# 使用系统默认 DNS' /root/realm/config.toml
+        sed -i '/# DNS 配置将在此处添加/c\# 使用系统默认 DNS' "${REALM_DIR}/config.toml"
+    fi
+
+    # 创建 systemd 服务文件
+    local service_path="/etc/systemd/system/realm.service"
+    if [ "$DISTRO_TYPE" = "rhel" ]; then
+        # RHEL 系统需要特殊处理 SELinux
+        if command -v sestatus >/dev/null 2>&1 && sestatus | grep -q "enabled"; then
+            echo -e "${COLOR_YELLOW}检测到 SELinux 已启用，正在配置相关权限...${COLOR_RESET}"
+            $PKG_INSTALL policycoreutils-python-utils >/dev/null 2>&1
+            semanage fcontext -a -t bin_t "${REALM_DIR}/realm(/.*)?"
+            restorecon -R "${REALM_DIR}"
+        fi
     fi
 
     # 创建服务文件
-    echo "[Unit]
+    cat > "$service_path" << EOF
+[Unit]
 Description=realm
 After=network-online.target
 Wants=network-online.target systemd-networkd-wait-online.service
@@ -151,16 +423,20 @@ User=root
 Restart=on-failure
 RestartSec=5s
 DynamicUser=true
-WorkingDirectory=/root/realm
-ExecStart=/root/realm/realm -c /root/realm/config.toml
+WorkingDirectory=${REALM_DIR}
+ExecStart=${REALM_DIR}/realm -c ${REALM_DIR}/config.toml
+LimitNOFILE=1048576
 
 [Install]
-WantedBy=multi-user.target" > /etc/systemd/system/realm.service
+WantedBy=multi-user.target
+EOF
+
     systemctl daemon-reload
-    # 更新realm状态变量
+
+    # 更新 realm 状态变量
     realm_status="已安装"
-    realm_status_color="\033[0;32m" # 绿色
-    echo "部署完成。"
+    realm_status_color="\033[0;32m"
+    echo -e "${COLOR_GREEN}部署完成${COLOR_RESET}"
 }
 
 # 卸载realm
@@ -169,7 +445,7 @@ uninstall_realm() {
     systemctl disable realm
     rm -f /etc/systemd/system/realm.service
     systemctl daemon-reload
-    rm -rf /root/realm
+    rm -rf "${REALM_DIR}"
     echo "realm 已被卸载。"
     # 更新realm状态变量
     realm_status="未安装"
@@ -180,7 +456,7 @@ uninstall_realm() {
 delete_forward() {
     echo "当前转发规则："
     local IFS=$'\n' # 设置IFS仅以换行符作为分隔符
-    local lines=($(grep -n 'remote =' /root/realm/config.toml)) # 搜索所有包含转发规则的行
+    local lines=($(grep -n 'remote =' "${REALM_DIR}/config.toml")) # 搜索所有包含转发规则的行
     if [ ${#lines[@]} -eq 0 ]; then
         echo "没有发现任何转发规则。"
         return
@@ -192,7 +468,7 @@ delete_forward() {
     done
 
     echo "请输入要删除的转发规则序号，直接按回车返回主菜单。"
-    read -p "选择: " choice
+    choice=$(read_input "选择: ")
     if [ -z "$choice" ]; then
         echo "返回主菜单。"
         return
@@ -216,7 +492,7 @@ delete_forward() {
     local end_line=$(($line_number + 2))
 
     # 使用sed删除选中的转发规则
-    sed -i "${start_line},${end_line}d" /root/realm/config.toml
+    sed -i "${start_line},${end_line}d" "${REALM_DIR}/config.toml"
 
     echo "转发规则已删除。"
 }
@@ -224,11 +500,30 @@ delete_forward() {
 # 添加转发规则
 add_forward() {
     while true; do
-        read -p "请输入目标IP: " ip
-        read -p "请输入目标端口: " port
+        target_ip=$(read_input "请输入目标IP: ")
+        port=$(read_input "请输入目标端口: ")
+        listen_ip_option=$(read_input "是否指定监听IP? (默认0.0.0.0) (y/N): ")
+        listen_ip="0.0.0.0"
+
+        if [[ $listen_ip_option == "Y" || $listen_ip_option == "y" ]]; then
+            echo "可用的IP地址："
+            ip_addresses=($(ip -o addr show | awk '{print $4}' | cut -d/ -f1 | sort -u))
+            for i in "${!ip_addresses[@]}"; do
+                echo "$((i+1)). ${ip_addresses[i]}"
+            done
+            echo "$((${#ip_addresses[@]}+1)). 手动输入"
+
+            ip_choice=$(read_input "请选择监听IP (输入数字): ")
+            if [[ $ip_choice -le ${#ip_addresses[@]} ]]; then
+                listen_ip=${ip_addresses[$((ip_choice-1))]}
+            else
+                read -p "请输入监听IP: " listen_ip
+            fi
+        fi
+
         read -p "是否绑定特定IP或网络接口? (y/N): " bind_option
 
-        config="\n[[endpoints]]\nlisten = \"0.0.0.0:$port\"\nremote = \"$ip:$port\""
+        config="\n[[endpoints]]\nlisten = \"$listen_ip:$port\"\nremote = \"$target_ip:$port\""
 
         if [[ $bind_option == "Y" || $bind_option == "y" ]]; then
             read -p "请选择绑定选项 (1: 特定IP, 2: 网络接口): " bind_type
@@ -240,7 +535,7 @@ add_forward() {
                 done
                 echo "$((${#ip_addresses[@]}+1)). 手动输入"
 
-                read -p "请选择IP地址 (输入数字): " ip_choice
+                ip_choice=$(read_input "请选择IP地址 (输入数字): ")
                 if [[ $ip_choice -le ${#ip_addresses[@]} ]]; then
                     bind_ip=${ip_addresses[$((ip_choice-1))]}
                 else
@@ -255,7 +550,7 @@ add_forward() {
                 done
                 echo "$((${#interfaces[@]}+1)). 手动输入"
 
-                read -p "请选择网络接口 (输入数字): " interface_choice
+                interface_choice=$(read_input "请选择网络接口 (输入数字): ")
                 if [[ $interface_choice -le ${#interfaces[@]} ]]; then
                     interface=${interfaces[$((interface_choice-1))]}
                 else
@@ -267,7 +562,7 @@ add_forward() {
             fi
         fi
 
-        sed -i '/# 转发规则将在此处添加/i\'"$config" /root/realm/config.toml
+        sed -i '/# 转发规则将在此处添加/i\'"$config" "${REALM_DIR}/config.toml"
         echo "转发规则已添加。"
 
         read -p "是否继续添加(y/N)? " answer
@@ -277,22 +572,214 @@ add_forward() {
     done
 }
 
+# 添加修改转发的函数
+modify_forward() {
+    echo "当前转发规则："
+    local IFS=$'\n'
+    local lines=($(grep -n '\[\[endpoints\]\]' "${REALM_DIR}/config.toml"))
+    if [ ${#lines[@]} -eq 0 ]; then
+        echo "没有发现任何转发规则。"
+        return
+    fi
+
+    # 存储所有转发规则的信息
+    declare -a rules_info
+    local rule_count=0
+    local current_section=""
+    local listen_addr=""
+    local remote_addr=""
+    local section_start=0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ $line == *"[[endpoints]]"* ]]; then
+            ((rule_count++))
+            section_start=$(grep -n "$line" "${REALM_DIR}/config.toml" | cut -d: -f1)
+            current_section=$rule_count
+        elif [[ $line == *"listen ="* ]] && [ -n "$current_section" ]; then
+            listen_addr=$(echo $line | grep -oP 'listen = "\K[^"]+')
+            rules_info+=("$section_start|$listen_addr")
+        elif [[ $line == *"remote ="* ]] && [ -n "$current_section" ]; then
+            remote_addr=$(echo $line | grep -oP 'remote = "\K[^"]+')
+            echo "$rule_count. 监听: $listen_addr -> 转发: $remote_addr"
+            current_section=""
+        fi
+    done < "${REALM_DIR}/config.toml"
+
+    echo "请输入要修改的转发规则序号，直接按回车返回主菜单。"
+    read -r -p "选择: " choice
+    if [ -z "$choice" ]; then
+        return
+    fi
+
+    if ! [[ $choice =~ ^[0-9]+$ ]] || [ $choice -lt 1 ] || [ $choice -gt $rule_count ]; then
+        echo "无效的选择。"
+        return
+    fi
+
+    # 获取选中规则的信息
+    local selected_rule=${rules_info[$((choice-1))]}
+    local rule_line=${selected_rule%|*}
+    local current_listen=${selected_rule#*|}
+
+    # 获取当前配置
+    local current_remote=$(sed -n "$((rule_line+2))p" "${REALM_DIR}/config.toml" | grep -oP 'remote = "\K[^"]+')
+    local current_listen_ip=${current_listen%:*}
+    local current_listen_port=${current_listen#*:}
+    local current_remote_ip=${current_remote%:*}
+    local current_remote_port=${current_remote#*:}
+
+    echo "当前配置："
+    echo "监听地址: $current_listen_ip:$current_listen_port"
+    echo "转发地址: $current_remote_ip:$current_remote_port"
+    echo
+
+    # 询问修改项
+    read -r -p "是否修改监听IP? (当前: $current_listen_ip) (y/N): " modify_listen_ip
+    if [[ $modify_listen_ip == [Yy] ]]; then
+        echo "可用的IP地址："
+        ip_addresses=($(ip -o addr show | awk '{print $4}' | cut -d/ -f1 | sort -u))
+        ip_addresses+=("0.0.0.0")
+        for i in "${!ip_addresses[@]}"; do
+            echo "$((i+1)). ${ip_addresses[i]}"
+        done
+        read -r -p "请选择IP (输入数字) 或直接输入IP: " ip_choice
+        if [[ $ip_choice =~ ^[0-9]+$ ]] && [ $ip_choice -le ${#ip_addresses[@]} ]; then
+            current_listen_ip=${ip_addresses[$((ip_choice-1))]}
+        else
+            current_listen_ip=$ip_choice
+        fi
+    fi
+
+    read -r -p "是否修改监听端口? (当前: $current_listen_port) (y/N): " modify_listen_port
+    if [[ $modify_listen_port == [Yy] ]]; then
+        read -r -p "请输入新的监听端口: " new_listen_port
+        if [[ $new_listen_port =~ ^[0-9]+$ ]] && [ $new_listen_port -ge 1 ] && [ $new_listen_port -le 65535 ]; then
+            current_listen_port=$new_listen_port
+        else
+            echo "无效的端口号，保持原端口。"
+        fi
+    fi
+
+    read -r -p "是否修改目标IP? (当前: $current_remote_ip) (y/N): " modify_remote_ip
+    if [[ $modify_remote_ip == [Yy] ]]; then
+        read -r -p "请输入新的目标IP: " new_remote_ip
+        current_remote_ip=$new_remote_ip
+    fi
+
+    read -r -p "是否修改目标端口? (当前: $current_remote_port) (y/N): " modify_remote_port
+    if [[ $modify_remote_port == [Yy] ]]; then
+        read -r -p "请输入新的目标端口: " new_remote_port
+        if [[ $new_remote_port =~ ^[0-9]+$ ]] && [ $new_remote_port -ge 1 ] && [ $new_remote_port -le 65535 ]; then
+            current_remote_port=$new_remote_port
+        else
+            echo "无效的端口号，保持原端口。"
+        fi
+    fi
+
+    # 更新配置文件
+    sed -i "$((rule_line+1))c\listen = \"$current_listen_ip:$current_listen_port\"" "${REALM_DIR}/config.toml"
+    sed -i "$((rule_line+2))c\remote = \"$current_remote_ip:$current_remote_port\"" "${REALM_DIR}/config.toml"
+
+    echo "转发规则已更新："
+    echo "监听地址: $current_listen_ip:$current_listen_port"
+    echo "转发地址: $current_remote_ip:$current_remote_port"
+
+    read -r -p "是否重启服务以应用更改? (y/N): " restart_service
+    if [[ $restart_service == [Yy] ]]; then
+        systemctl restart realm
+        echo "服务已重启"
+    else
+        echo "请记得手动重启服务以应用更改"
+    fi
+}
+
 # 启动服务
 start_service() {
-    sudo systemctl unmask realm.service
+    # 检查服务文件是否存在
+    if [ ! -f "/etc/systemd/system/realm.service" ]; then
+        echo -e "${COLOR_RED}错误: realm 服务文件不存在${COLOR_RESET}"
+        wait_key
+        return 1
+    fi
+
+    # 检查可执行文件是否存在
+    if [ ! -f "${REALM_DIR}/realm" ]; then
+        echo -e "${COLOR_RED}错误: realm 可执行文件不存在${COLOR_RESET}"
+        wait_key
+        return 1
+    fi
+
+    # 检查配置文件是否存在
+    if [ ! -f "${REALM_DIR}/config.toml" ]; then
+        echo -e "${COLOR_RED}错误: realm 配置文件不存在${COLOR_RESET}"
+        wait_key
+        return 1
+    fi
+
+    # 重新加载 systemd 配置
+    echo -e "${COLOR_BLUE}重新加载 systemd 配置...${COLOR_RESET}"
     sudo systemctl daemon-reload
-    sudo systemctl restart realm.service
-    sudo systemctl enable realm.service
-    echo "realm 服务已启动并设置为开机自启。"
+
+    # 取消服务屏蔽（如果被屏蔽）
+    echo -e "${COLOR_BLUE}取消服务屏蔽...${COLOR_RESET}"
+    sudo systemctl unmask realm.service
+
+    # 启动服务
+    echo -e "${COLOR_BLUE}正在启动 realm 服务...${COLOR_RESET}"
+    if ! sudo systemctl start realm.service; then
+        echo -e "${COLOR_RED}错误: 启动服务失败${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}查看服务状态...${COLOR_RESET}"
+        sudo systemctl status realm.service
+        wait_key
+        return 1
+    fi
+
+    # 设置开机自启
+    echo -e "${COLOR_BLUE}设置开机自启...${COLOR_RESET}"
+    if ! sudo systemctl enable realm.service; then
+        echo -e "${COLOR_YELLOW}警告: 设置开机自启失败${COLOR_RESET}"
+    fi
+
+    # 验证服务状态
+    if systemctl is-active --quiet realm; then
+        echo -e "${COLOR_GREEN}realm 服务已成功启动并设置为开机自启${COLOR_RESET}"
+        wait_key
+        return 0
+    else
+        echo -e "${COLOR_RED}错误: 服务启动失败，请检查日志${COLOR_RESET}"
+        sudo systemctl status realm.service
+        wait_key
+        return 1
+    fi
 }
 
 # 停止服务
 stop_service() {
-    systemctl stop realm
-    echo "realm 服务已停止。"
+    echo -e "${COLOR_BLUE}正在停止 realm 服务...${COLOR_RESET}"
+    if systemctl stop realm; then
+        echo -e "${COLOR_GREEN}realm 服务已停止${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}停止服务失败${COLOR_RESET}"
+    fi
+    wait_key
+    return 0
 }
 
-# 升级 realm 的函数
+# 重启服务
+restart_service() {
+    echo -e "${COLOR_BLUE}正在重启 realm 服务...${COLOR_RESET}"
+    if systemctl restart realm; then
+        echo -e "${COLOR_GREEN}realm 服务已重启${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}重启服务失败${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}查看服务状态...${COLOR_RESET}"
+        systemctl status realm
+    fi
+    wait_key
+    return 0
+}
+
+# 修改升级函数
 upgrade_realm() {
     local current_version=$(get_local_realm_version)
     if [ "$current_version" == "未安装" ]; then
@@ -300,21 +787,24 @@ upgrade_realm() {
         return
     fi
 
-    echo "当前版本: $current_version"
-    echo "最新版本: $REALM_VERSION"
+    # 获取最新版本
+    local latest_version=$(get_latest_version || echo "$REALM_VERSION")
 
-    if [ "$current_version" == "$REALM_VERSION" ]; then
+    echo "当前版本: $current_version"
+    echo "最新版本: $latest_version"
+
+    if [ "$current_version" == "$latest_version" ]; then
         echo "已经是最新版本，无需升级。"
         return
     fi
 
-    read -p "是否升级到 $REALM_VERSION? (y/N): " confirm
+    confirm=$(read_input "是否升级到 $latest_version? (y/N): ")
     if [[ $confirm != [Yy] ]]; then
         echo "取消升级。"
         return
     fi
 
-    cd /root/realm
+    cd "${REALM_DIR}"
     # 停止服务
     systemctl stop realm
 
@@ -327,64 +817,153 @@ upgrade_realm() {
     rm -f realm-*  # 删除所有旧版本
 
     # 下载并安装新版本
-    wget -O realm.tar.gz https://github.com/zhboner/realm/releases/download/${REALM_VERSION}/realm-x86_64-unknown-linux-gnu.tar.gz
+    wget -O realm.tar.gz "https://github.com/zhboner/realm/releases/download/${latest_version}/realm-x86_64-unknown-linux-gnu.tar.gz"
+    if [ $? -ne 0 ]; then
+        echo -e "${COLOR_RED}下载失败，升级中止${COLOR_RESET}"
+        # 恢复配置文件
+        mv config.toml.backup config.toml
+        return 1
+    fi
+
     tar -xvf realm.tar.gz
-    mv realm realm-${REALM_VERSION#v}
-    ln -sf realm-${REALM_VERSION#v} realm
-    chmod +x realm-${REALM_VERSION#v}
+    mv realm realm-${latest_version#v}
+    ln -sf realm-${latest_version#v} realm
+    chmod +x realm-${latest_version#v}
 
     # 恢复配置文件
     mv config.toml.backup config.toml
 
-    echo "realm 已升级到 $REALM_VERSION"
+    # 更新预设版本为最新版本
+    REALM_VERSION="$latest_version"
+
+    echo -e "${COLOR_GREEN}realm 已升级到 $latest_version${COLOR_RESET}"
     systemctl restart realm
-    echo "realm 服务已重启。"
+    echo -e "${COLOR_GREEN}realm 服务已重启${COLOR_RESET}"
 }
+
+# 列出所有转发规则
+list_forwards() {
+    if [ ! -f "${REALM_DIR}/config.toml" ]; then
+        echo "配置文件不存在！"
+        return
+    fi
+
+    echo "当前所有转发规则："
+    echo "==================="
+
+    local IFS=$'\n'
+    local rules=($(grep -A 2 '^\[\[endpoints\]\]' "${REALM_DIR}/config.toml"))
+
+    if [ ${#rules[@]} -eq 0 ]; then
+        echo "没有找到任何转发规则。"
+        return
+    fi
+
+    local rule_count=0
+    for ((i=0; i<${#rules[@]}; i+=3)); do
+        if [[ "${rules[i]}" == "[[endpoints]]" ]]; then
+            ((rule_count++))
+            echo -e "\n规则 $rule_count:"
+
+            # 提取监听地址
+            local listen=$(echo "${rules[i+1]}" | grep -oP 'listen = "\K[^"]+')
+            echo "监听地址: $listen"
+
+            # 提取远程地址
+            local remote=$(echo "${rules[i+2]}" | grep -oP 'remote = "\K[^"]+')
+            echo "转发地址: $remote"
+
+            # 检查是否有额外的绑定设置
+            local through=$(grep -A 1 "remote = \"$remote\"" "${REALM_DIR}/config.toml" | grep 'through' | grep -oP 'through = "\K[^"]+')
+            local interface=$(grep -A 1 "remote = \"$remote\"" "${REALM_DIR}/config.toml" | grep 'interface' | grep -oP 'interface = "\K[^"]+')
+
+            [ ! -z "$through" ] && echo "绑定IP: $through"
+            [ ! -z "$interface" ] && echo "绑定接口: $interface"
+        fi
+    done
+    echo -e "\n==================="
+}
+
+# 在主循环之前添加
+# 检查是否在终端中运行
+if [ ! -t 0 ]; then
+    # 如果不是在终端中运行，则自动进入交互模式
+    exec </dev/tty >/dev/tty 2>&1
+fi
+
+# 在脚本开始处（主循环之前）添加发行版检测
+detect_distro
+init_latest_version  # 初始化时获取最新版本
 
 # 主循环
 while true; do
+    check_realm_status
     show_main_menu
-    read -p "请选择一个选项: " choice
+    read -r -p "请选择一个选项: " choice
     case $choice in
         1)  # 服务管理
             while true; do
                 show_service_menu
-                read -p "请选择一个选项: " service_choice
+                read -r -p "请选择一个选项: " service_choice
                 case $service_choice in
-                    1) start_service ;;
-                    2) stop_service ;;
-                    3) show_config ;;
+                    1)
+                        start_service
+                        break
+                        ;;
+                    2)
+                        stop_service
+                        break
+                        ;;
+                    3)
+                        restart_service
+                        break
+                        ;;
+                    4)
+                        show_config
+                        wait_key
+                        ;;
                     0) break ;;
-                    *) echo "无效选项: $service_choice" ;;
+                    *)
+                        echo "无效选项: $service_choice"
+                        wait_key
+                        ;;
                 esac
-                read -p "按任意键继续..." key
             done
             ;;
         2)  # 转发管理
             while true; do
                 show_forward_menu
-                read -p "请选择一个选项: " forward_choice
+                read -r -p "请选择一个选项: " forward_choice
                 case $forward_choice in
                     1) add_forward ;;
                     2) delete_forward ;;
+                    3) modify_forward ;;
+                    4) list_forwards ;;
                     0) break ;;
                     *) echo "无效选项: $forward_choice" ;;
                 esac
-                read -p "按任意键继续..." key
+                wait_key
             done
             ;;
         3)  # 系统维护
             while true; do
                 show_maintenance_menu
-                read -p "请选择一个选项: " maintenance_choice
+                read -r -p "请选择一个选项: " maintenance_choice
                 case $maintenance_choice in
                     1) deploy_realm ;;
                     2) upgrade_realm ;;
                     3) uninstall_realm ;;
+                    4)
+                        if [ -f "/usr/local/bin/realm-manager" ]; then
+                            remove_shortcut
+                        else
+                            create_shortcut_internal
+                        fi
+                        ;;
                     0) break ;;
                     *) echo "无效选项: $maintenance_choice" ;;
                 esac
-                read -p "按任意键继续..." key
+                wait_key
             done
             ;;
         0)
@@ -392,6 +971,11 @@ while true; do
             ;;
         *)
             echo "无效选项: $choice"
+            wait_key
             ;;
     esac
 done
+
+# 在主循环之前调用这个函数
+# 在脚本开始处（主循环之前）添加：
+check_and_create_shortcut

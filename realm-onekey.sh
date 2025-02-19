@@ -605,7 +605,7 @@ add_forward() {
         listen_ip_option=$(read_input "是否指定监听IP? (默认: IPv4为0.0.0.0，IPv6为[::]) (y/N): ")
 
         # 根据目标IP类型设置默认监听IP
-        if [[ $target_ip =~ :]]; then
+        if [[ "$target_ip" =~ : ]]; then
             listen_ip="[::]"  # IPv6 默认值
         else
             listen_ip="0.0.0.0"  # IPv4 默认值
@@ -614,7 +614,7 @@ add_forward() {
         if [[ $listen_ip_option == "Y" || $listen_ip_option == "y" ]]; then
             echo "可用的IP地址："
             # 根据目标IP类型只显示相应的IP版本
-            if [[ $target_ip =~ :]]; then
+            if [[ "$target_ip" =~ : ]]; then
                 # 只显示IPv6地址
                 echo "IPv6 地址:"
                 mapfile -t all_ips < <(ip -6 addr show | grep "inet6" | grep -v "fe80" | awk '{print $2}' | cut -d'/' -f1)
@@ -636,9 +636,9 @@ add_forward() {
             else
                 # 验证手动输入的 IP 与目标 IP 版本是否匹配
                 if validate_ip "$ip_choice"; then
-                    if [[ $target_ip =~ : ]] && [[ $ip_choice =~ : ]]; then
+                    if [[ "$target_ip" =~ : ]] && [[ "$ip_choice" =~ : ]]; then
                         listen_ip=$ip_choice
-                    elif [[ ! $target_ip =~ : ]] && [[ ! $ip_choice =~ : ]]; then
+                    elif [[ ! "$target_ip" =~ : ]] && [[ ! "$ip_choice" =~ : ]]; then
                         listen_ip=$ip_choice
                     else
                         echo "监听IP版本与目标IP版本不匹配，使用默认值"
@@ -650,10 +650,10 @@ add_forward() {
         fi
 
         # IPv6 地址需要用方括号括起来
-        if [[ $listen_ip =~ : ]] && [[ $listen_ip != \[*\] ]]; then
+        if [[ "$listen_ip" =~ : ]] && [[ "$listen_ip" != \[*\] ]]; then
             listen_ip="[$listen_ip]"
         fi
-        if [[ $target_ip =~ : ]] && [[ $target_ip != \[*\] ]]; then
+        if [[ "$target_ip" =~ : ]] && [[ "$target_ip" != \[*\] ]]; then
             target_ip="[$target_ip]"
         fi
 
@@ -832,7 +832,7 @@ modify_forward() {
     fi
 
     # 更新配置文件
-    local new_listen="listen = \"$current_listen_ip:$current_listen_port\""
+    local new_listen="listen = \"$current_listen_ip:$current_listen_port"
     sed -i "$((rule_line+1))c\\$new_listen" "${REALM_DIR}/config.toml"
 
     echo "转发规则已更新："

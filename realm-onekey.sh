@@ -428,38 +428,38 @@ get_all_ips() {
 get_interfaces_with_ips() {
     local interfaces=()
     local interface_ips=()
-    
+
     # 获取所有网卡列表
     local all_interfaces=$(ip -o link show | grep -v "lo:" | awk -F': ' '{print $2}' | cut -d'@' -f1)
-    
+
     for interface in $all_interfaces; do
         # 尝试获取IPv4地址
         local ipv4=$(ip -4 addr show dev "$interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $2}' | cut -d/ -f1)
-        
+
         # 如果有IPv4地址，添加到列表
         if [[ -n "$ipv4" ]]; then
             interfaces+=("$interface")
             interface_ips+=("$ipv4")
             continue
         fi
-        
+
         # 如果没有IPv4，尝试获取非链路本地IPv6地址
         local ipv6=$(ip -6 addr show dev "$interface" 2>/dev/null | grep -v "scope link" | grep -w inet6 | head -n 1 | awk '{print $2}' | cut -d/ -f1)
-        
+
         # 如果有IPv6地址，添加到列表
         if [[ -n "$ipv6" ]]; then
             interfaces+=("$interface")
             interface_ips+=("$ipv6")
         fi
     done
-    
+
     # 打印网卡和IP列表
     if [[ ${#interfaces[@]} -gt 0 ]]; then
         for i in "${!interfaces[@]}"; do
             echo "$((i+1)). ${interfaces[i]} (${interface_ips[i]})"
         done
     fi
-    
+
     # 以特殊格式返回结果，方便后续处理
     echo "${interfaces[*]}" ";" "${interface_ips[*]}"
 }
@@ -721,7 +721,7 @@ add_forward() {
             local interfaces_output=$(get_interfaces_with_ips)
             local interfaces_list=$(echo "$interfaces_output" | grep -E '^[0-9]+\.')
             local interfaces_data=$(echo "$interfaces_output" | grep -v -E '^[0-9]+\.')
-            
+
             # 打印网卡列表
             if [[ -n "$interfaces_list" ]]; then
                 echo "$interfaces_list"
@@ -735,11 +735,11 @@ add_forward() {
                 config+="\nlisten = \"$listen_ip:$port\""
                 continue
             fi
-            
+
             # 解析网卡数据
             IFS=';' read -ra parts <<< "$interfaces_data"
             IFS=' ' read -ra interface_names <<< "${parts[0]}"
-            
+
             if [[ ${#interface_names[@]} -eq 0 ]]; then
                 echo "未找到可用网卡，使用默认IP监听"
                 if [[ "$target_ip" =~ : ]]; then
@@ -812,7 +812,7 @@ add_forward() {
                 local interfaces_output=$(get_interfaces_with_ips)
                 local interfaces_list=$(echo "$interfaces_output" | grep -E '^[0-9]+\.')
                 local interfaces_data=$(echo "$interfaces_output" | grep -v -E '^[0-9]+\.')
-                
+
                 # 打印网卡列表
                 if [[ -n "$interfaces_list" ]]; then
                     echo "$interfaces_list"
@@ -820,16 +820,16 @@ add_forward() {
                     echo "未找到可用网卡，跳过绑定"
                     continue
                 fi
-                
+
                 # 解析网卡数据
                 IFS=';' read -ra parts <<< "$interfaces_data"
                 IFS=' ' read -ra interface_names <<< "${parts[0]}"
-                
+
                 if [[ ${#interface_names[@]} -eq 0 ]]; then
                     echo "未找到可用网卡，跳过绑定"
                     continue
                 fi
-                
+
                 # 用户选择网卡
                 interface_choice=$(read_input "请选择网络接口 (输入数字): ")
                 if [[ $interface_choice =~ ^[0-9]+$ ]] && [ $interface_choice -ge 1 ] && [ $interface_choice -le ${#interface_names[@]} ]; then
@@ -1002,7 +1002,7 @@ modify_forward() {
                 local interfaces_output=$(get_interfaces_with_ips)
                 local interfaces_list=$(echo "$interfaces_output" | grep -E '^[0-9]+\.')
                 local interfaces_data=$(echo "$interfaces_output" | grep -v -E '^[0-9]+\.')
-                
+
                 # 打印网卡列表
                 if [[ -n "$interfaces_list" ]]; then
                     echo "$interfaces_list"
@@ -1010,21 +1010,21 @@ modify_forward() {
                     echo "未找到可用网卡，取消修改"
                     return
                 fi
-                
+
                 # 解析网卡数据
                 IFS=';' read -ra parts <<< "$interfaces_data"
                 IFS=' ' read -ra interface_names <<< "${parts[0]}"
-                
+
                 if [[ ${#interface_names[@]} -eq 0 ]]; then
                     echo "未找到可用网卡，取消修改"
                     return
                 fi
-                
+
                 # 用户选择网卡
                 interface_choice=$(read_input "请选择网卡接口 (输入数字): ")
                 if [[ $interface_choice =~ ^[0-9]+$ ]] && [ $interface_choice -ge 1 ] && [ $interface_choice -le ${#interface_names[@]} ]; then
                     new_listen_interface=${interface_names[$((interface_choice-1))]}
-                    
+
                     # 查找是否已有listen_interface行
                     if grep -q "listen_interface" <(echo "$rule_content"); then
                         # 更新现有行
@@ -1033,7 +1033,7 @@ modify_forward() {
                         # 在listen行后添加新行
                         sed -i "/listen =/ a\\listen_interface = \"$new_listen_interface\"" "${REALM_DIR}/config.toml"
                     fi
-                    
+
                     # 确保listen地址为正确的通配符地址
                     if [[ "${current_remote}" =~ .*:.* && ! "${current_remote}" =~ [0-9]+\.[0-9]+ ]]; then
                         # IPv6 目标，使用[::]
@@ -1273,42 +1273,87 @@ list_forwards() {
     echo "==================="
 
     # 检查是否有转发规则
-    local has_rules=$(grep -c "\[\[endpoints\]\]" "${REALM_DIR}/config.toml")
-    
-    if [ "$has_rules" -eq 0 ]; then
+    if ! grep -q "\[\[endpoints\]\]" "${REALM_DIR}/config.toml"; then
         echo "没有找到任何转发规则。"
         echo "==================="
         return
     fi
 
-    local rule_count=0
-    
-    # 使用简单方法逐段读取规则块
-    while IFS= read -r line; do
-        if [[ "$line" == *"[[endpoints]]"* ]]; then
-            ((rule_count++))
-            echo -e "\n规则 $rule_count:"
-            
-            # 获取这个规则后面的几行
-            local section_content=$(sed -n "/\[\[endpoints\]\]/,/\[\[endpoints\]\]/p" "${REALM_DIR}/config.toml" | 
-                                  sed -n "$((rule_count))q;$((rule_count))p,/\[\[endpoints\]\]/p" | 
-                                  sed '$d')
-            
-            # 提取并打印信息
-            local listen=$(echo "$section_content" | grep 'listen =' | grep -o '"[^"]*"' | tr -d '"')
-            local remote=$(echo "$section_content" | grep 'remote =' | grep -o '"[^"]*"' | tr -d '"')
-            local listen_interface=$(echo "$section_content" | grep 'listen_interface =' | grep -o '"[^"]*"' | tr -d '"')
-            local through=$(echo "$section_content" | grep 'through =' | grep -o '"[^"]*"' | tr -d '"')
-            local interface=$(echo "$section_content" | grep 'interface =' | grep -o '"[^"]*"' | tr -d '"')
-            
-            echo "监听地址: $listen"
-            [ ! -z "$listen_interface" ] && echo "监听网卡: $listen_interface"
-            echo "转发地址: $remote"
-            [ ! -z "$through" ] && echo "绑定IP: $through"
-            [ ! -z "$interface" ] && echo "绑定网卡: $interface"
+    # 获取所有端点块的开始行号
+    local start_lines=($(grep -n "\[\[endpoints\]\]" "${REALM_DIR}/config.toml" | cut -d: -f1))
+    local rule_count=${#start_lines[@]}
+
+    # 用于存储每个规则块的内容
+    local rule_contents=()
+
+    # 提取每个规则块的内容
+    for i in $(seq 0 $((rule_count-1))); do
+        local start_line=${start_lines[$i]}
+        local end_line
+
+        if [ $i -lt $((rule_count-1)) ]; then
+            # 如果不是最后一个规则，结束行是下一个规则的开始行减1
+            end_line=$((${start_lines[$((i+1))]}-1))
+        else
+            # 如果是最后一个规则，结束行是文件末尾
+            end_line=$(wc -l < "${REALM_DIR}/config.toml")
         fi
-    done < <(grep -n "\[\[endpoints\]\]" "${REALM_DIR}/config.toml")
-    
+
+        # 提取规则块内容
+        rule_contents[$i]=$(sed -n "${start_line},${end_line}p" "${REALM_DIR}/config.toml")
+    done
+
+    # 逐个处理规则块并显示
+    for i in $(seq 0 $((rule_count-1))); do
+        local rule_content="${rule_contents[$i]}"
+        local rule_num=$((i+1))
+
+        echo -e "\n规则 $rule_num:"
+
+        # 提取监听地址
+        local listen=$(echo "$rule_content" | grep 'listen =' | grep -o '"[^"]*"' | tr -d '"')
+
+        # 提取网卡接口
+        local listen_interface=$(echo "$rule_content" | grep 'listen_interface =' | grep -o '"[^"]*"' | tr -d '"')
+
+        # 提取转发地址
+        local remote=$(echo "$rule_content" | grep 'remote =' | grep -o '"[^"]*"' | tr -d '"')
+
+        # 提取其他选项
+        local through=$(echo "$rule_content" | grep 'through =' | grep -o '"[^"]*"' | tr -d '"')
+        local interface=$(echo "$rule_content" | grep 'interface =' | grep -o '"[^"]*"' | tr -d '"')
+
+        # 显示信息
+        echo "监听地址: $listen"
+
+        if [[ -n "$listen_interface" ]]; then
+            # 获取该网卡的IP地址（如果可能）
+            local interface_ip=$(ip -o addr show dev "$listen_interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $4}' | cut -d/ -f1)
+            if [[ -n "$interface_ip" ]]; then
+                echo "监听网卡: $listen_interface ($interface_ip)"
+            else
+                echo "监听网卡: $listen_interface"
+            fi
+        fi
+
+        echo "转发地址: $remote"
+
+        # 显示绑定相关配置
+        if [[ -n "$through" ]]; then
+            echo "绑定IP: $through"
+        fi
+
+        if [[ -n "$interface" ]]; then
+            # 获取绑定网卡的IP地址（如果可能）
+            local bind_if_ip=$(ip -o addr show dev "$interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $4}' | cut -d/ -f1)
+            if [[ -n "$bind_if_ip" ]]; then
+                echo "绑定网卡: $interface ($bind_if_ip)"
+            else
+                echo "绑定网卡: $interface"
+            fi
+        fi
+    done
+
     echo -e "\n==================="
 }
 

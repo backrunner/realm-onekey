@@ -424,60 +424,83 @@ get_all_ips() {
     echo "${ipv4_addrs[@]}" "${ipv6_addrs[@]}"
 }
 
-# 获取网卡及其主IP地址（改进版本，支持别名网卡）
+# 获取网卡及其主IP地址（完全重写版本，确保支持别名网卡）
 get_interfaces_with_ips() {
     local interfaces=()
     local interface_ips=()
 
-    # 使用ip命令获取所有网卡和别名
-    while IFS= read -r line; do
-        if [[ $line =~ ^[0-9]+:\ ([^:@]+)(@[^:]+)?:\ .* ]]; then
-            local base_interface="${BASH_REMATCH[1]}"
+    # 检查ifconfig命令是否可用
+    if command -v ifconfig &> /dev/null; then
+        # 使用ifconfig获取所有网络接口（包括别名接口）
+        while IFS= read -r line; do
+            if [[ $line =~ ^([a-zA-Z0-9:._-]+)[[:space:]] ]]; then
+                local interface="${BASH_REMATCH[1]}"
 
-            # 跳过lo接口
-            if [[ "$base_interface" == "lo" ]]; then
-                continue
-            fi
+                # 跳过lo接口
+                if [[ "$interface" == "lo" ]]; then
+                    continue
+                fi
 
-            # 添加基本接口
-            if ! [[ " ${interfaces[*]} " =~ " $base_interface " ]]; then
-                # 获取基本接口的IP
-                local base_ip=$(ip -4 addr show dev "$base_interface" 2>/dev/null | grep -v secondary | grep -w inet | head -n 1 | awk '{print $2}' | cut -d/ -f1)
-                if [[ -n "$base_ip" ]]; then
-                    interfaces+=("$base_interface")
-                    interface_ips+=("$base_ip")
+                # 获取接口的IP地址
+                local ip_addr=$(ifconfig "$interface" | grep -w inet | awk '{print $2}')
+
+                # 如果有IPv4地址
+                if [[ -n "$ip_addr" ]]; then
+                    interfaces+=("$interface")
+                    interface_ips+=("$ip_addr")
                 else
-                    # 如果没有IPv4地址，尝试IPv6
-                    local base_ipv6=$(ip -6 addr show dev "$base_interface" 2>/dev/null | grep -v "scope link" | grep -w inet6 | head -n 1 | awk '{print $2}' | cut -d/ -f1)
-                    if [[ -n "$base_ipv6" ]]; then
-                        interfaces+=("$base_interface")
-                        interface_ips+=("$base_ipv6")
+                    # 尝试获取IPv6地址
+                    local ipv6=$(ifconfig "$interface" | grep -w inet6 | grep -v "scope link" | awk '{print $2}')
+                    if [[ -n "$ipv6" ]]; then
+                        interfaces+=("$interface")
+                        interface_ips+=("$ipv6")
                     fi
                 fi
             fi
-        fi
-    done < <(ip -o link show | grep -v "LOOPBACK")
+        done < <(ifconfig -a | grep -E "^[a-zA-Z0-9:._-]+")
+    else
+        # 回退到使用ip命令
+        # 首先获取所有活动的网络接口名称（包括别名）
+        local all_interfaces=$(ip -o link show | grep -v "lo:" | awk '{print $2}' | sed 's/://' | sed 's/@.*//')
 
-    # 获取所有别名接口
-    while IFS= read -r line; do
-        if [[ $line =~ ^[0-9]+:\ ([^:@]+:[0-9]+)(@[^:]+)?:\ .* ]]; then
-            local alias_interface="${BASH_REMATCH[1]}"
+        # 遍历所有网络接口获取IP地址
+        for interface in $all_interfaces; do
+            # 跳过loopback接口
+            if [[ "$interface" == "lo" ]]; then
+                continue
+            fi
 
-            # 获取别名接口的IP
-            local alias_ip=$(ip -4 addr show dev "$alias_interface" 2>/dev/null | grep -v secondary | grep -w inet | head -n 1 | awk '{print $2}' | cut -d/ -f1)
-            if [[ -n "$alias_ip" ]]; then
-                interfaces+=("$alias_interface")
-                interface_ips+=("$alias_ip")
+            # 尝试获取IPv4地址
+            local ipv4=$(ip -4 addr show dev "$interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $2}' | cut -d/ -f1)
+
+            # 如果有IPv4地址
+            if [[ -n "$ipv4" ]]; then
+                interfaces+=("$interface")
+                interface_ips+=("$ipv4")
             else
-                # 如果没有IPv4地址，尝试IPv6
-                local alias_ipv6=$(ip -6 addr show dev "$alias_interface" 2>/dev/null | grep -v "scope link" | grep -w inet6 | head -n 1 | awk '{print $2}' | cut -d/ -f1)
-                if [[ -n "$alias_ipv6" ]]; then
-                    interfaces+=("$alias_interface")
-                    interface_ips+=("$alias_ipv6")
+                # 尝试获取非链路本地IPv6地址
+                local ipv6=$(ip -6 addr show dev "$interface" 2>/dev/null | grep -v "scope link" | grep -w inet6 | head -n 1 | awk '{print $2}' | cut -d/ -f1)
+
+                # 如果有IPv6地址
+                if [[ -n "$ipv6" ]]; then
+                    interfaces+=("$interface")
+                    interface_ips+=("$ipv6")
                 fi
             fi
-        fi
-    done < <(ip -o link show | grep -v "LOOPBACK" | grep ":")
+        done
+
+        # 获取别名接口
+        while IFS= read -r line; do
+            local interface_name=$(echo "$line" | awk '{print $2}' | sed 's/://')
+            local ip_addr=$(echo "$line" | awk '{print $4}' | cut -d/ -f1)
+
+            # 确保是别名接口 (包含冒号)
+            if [[ "$interface_name" == *:* ]]; then
+                interfaces+=("$interface_name")
+                interface_ips+=("$ip_addr")
+            fi
+        done < <(ip -o addr show | grep "inet " | grep -v "scope host lo")
+    fi
 
     # 打印网卡和IP列表
     if [[ ${#interfaces[@]} -gt 0 ]]; then
@@ -762,10 +785,10 @@ add_forward() {
                 continue
             fi
 
-            # 解析网卡数据，确保支持别名
+            # 解析网卡数据，确保正确处理包含冒号的别名网卡
             IFS=';' read -ra parts <<< "$interfaces_data"
-            # 使用更安全的方法处理包含空格和冒号的网卡名
-            read -ra interface_names <<< "${parts[0]//,/ }"
+            # 不使用read命令，而是手动分割字符串，以确保处理特殊字符
+            interface_names=(${parts[0]})
 
             if [[ ${#interface_names[@]} -eq 0 ]]; then
                 echo "未找到可用网卡，使用默认IP监听"
@@ -878,14 +901,8 @@ add_forward() {
                 echo "监听地址: 0.0.0.0:$port (未选择特定网卡)"
             fi
         else
-            # 支持别名网卡
-            if [[ "$listen_interface" == *:* ]]; then
-                # 别名网卡直接获取IP
-                local interface_ip=$(ip -o addr show dev "$listen_interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $4}' | cut -d/ -f1)
-            else
-                # 常规网卡获取IP
-                local interface_ip=$(ip -o addr show dev "$listen_interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $4}' | cut -d/ -f1)
-            fi
+            # 不需要区分别名和普通网卡，直接获取IP
+            local interface_ip=$(ip -o addr show dev "$listen_interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $4}' | cut -d/ -f1)
 
             if [[ -n "$interface_ip" ]]; then
                 echo "监听网卡: $listen_interface ($interface_ip)"
@@ -1051,10 +1068,10 @@ modify_forward() {
                     return
                 fi
 
-                # 解析网卡数据，确保支持别名
+                # 解析网卡数据，确保正确处理包含冒号的别名网卡
                 IFS=';' read -ra parts <<< "$interfaces_data"
-                # 使用更安全的方法处理包含空格和冒号的网卡名
-                read -ra interface_names <<< "${parts[0]//,/ }"
+                # 不使用read命令，而是手动分割字符串，以确保处理特殊字符
+                interface_names=(${parts[0]})
 
                 if [[ ${#interface_names[@]} -eq 0 ]]; then
                     echo "未找到可用网卡，取消修改"
@@ -1368,14 +1385,8 @@ list_forwards() {
         echo "监听地址: $listen"
 
         if [[ -n "$listen_interface" ]]; then
-            # 支持别名网卡
-            if [[ "$listen_interface" == *:* ]]; then
-                # 别名网卡直接获取IP
-                local interface_ip=$(ip -o addr show dev "$listen_interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $4}' | cut -d/ -f1)
-            else
-                # 常规网卡获取IP
-                local interface_ip=$(ip -o addr show dev "$listen_interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $4}' | cut -d/ -f1)
-            fi
+            # 不需要区分别名和普通网卡，直接获取IP
+            local interface_ip=$(ip -o addr show dev "$listen_interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $4}' | cut -d/ -f1)
 
             if [[ -n "$interface_ip" ]]; then
                 echo "监听网卡: $listen_interface ($interface_ip)"

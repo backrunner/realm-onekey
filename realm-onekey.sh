@@ -431,15 +431,14 @@ get_interfaces_with_ips() {
     
     # 读取所有网卡名称及其IPv4地址
     while IFS= read -r line; do
-        local interface=$(echo "$line" | awk '{print $2}')
-        interface=${interface%:}  # 移除冒号
+        local interface=$(echo "$line" | awk -F': ' '{print $2}' | cut -d'@' -f1)
         
         # 排除lo接口和无效接口
         if [[ "$interface" != "lo" && "$interface" != "" ]]; then
             # 获取该网卡的主IPv4地址
             local ipv4=$(ip -4 addr show dev "$interface" 2>/dev/null | grep -v secondary | grep -w inet | head -n 1 | awk '{print $2}' | cut -d/ -f1)
             
-            # 如果没有IPv4，尝试获取IPv6地址
+            # 如果没有IPv4，尝试获取IPv6地址(非链路本地地址)
             if [[ -z "$ipv4" ]]; then
                 local ipv6=$(ip -6 addr show dev "$interface" 2>/dev/null | grep -v secondary | grep -v fe80 | grep -w inet6 | head -n 1 | awk '{print $2}' | cut -d/ -f1)
                 
@@ -453,7 +452,7 @@ get_interfaces_with_ips() {
                 interface_ips+=("$ipv4")
             fi
         fi
-    done < <(ip -o link show | grep -v "link/ieee802.11" | grep -v "link/none")
+    done < <(ip -o link show | grep -v "LOOPBACK" | grep "state UP")
     
     # 打印网卡和IP列表
     for i in "${!interfaces[@]}"; do
@@ -717,47 +716,54 @@ add_forward() {
         else
             # 使用网卡接口监听
             echo "可用的网卡接口："
-            # 获取网卡和IP信息
             output=$(get_interfaces_with_ips)
             
+            # 检查输出是否为空
             if [[ -z "$output" ]]; then
-                echo "未找到可用网卡，取消修改"
-                return
-            fi
-            
-            # 分割输出以获取网卡名称和IP地址数组
-            IFS=';' read -ra parts <<< "$output"
-            IFS=' ' read -ra interfaces <<< "${parts[0]}"
-            
-            if [[ ${#interfaces[@]} -eq 0 ]]; then
-                echo "未找到可用网卡，取消修改"
-                return
-            fi
-            
-            # 用户选择网卡
-            interface_choice=$(read_input "请选择网卡接口 (输入数字): ")
-            if [[ $interface_choice =~ ^[0-9]+$ ]] && [ $interface_choice -ge 1 ] && [ $interface_choice -le ${#interfaces[@]} ]; then
-                new_listen_interface=${interfaces[$((interface_choice-1))]}
-                
-                # 查找是否已有listen_interface行
-                if grep -q "listen_interface" <(echo "$rule_content"); then
-                    # 更新现有行
-                    sed -i "/listen_interface =/ c\\listen_interface = \"$new_listen_interface\"" "${REALM_DIR}/config.toml"
+                echo "未找到可用网卡，使用默认IP地址监听"
+                if [[ "$target_ip" =~ : ]]; then
+                    listen_ip="[::]"  # IPv6 默认值
                 else
-                    # 在listen行后添加新行
-                    sed -i "/listen =/ a\\listen_interface = \"$new_listen_interface\"" "${REALM_DIR}/config.toml"
+                    listen_ip="0.0.0.0"  # IPv4 默认值
                 fi
-                
-                # 确保listen地址为正确的通配符地址
-                if [[ "${current_remote}" =~ .*:.* && ! "${current_remote}" =~ [0-9]+\.[0-9]+ ]]; then
-                    # IPv6 目标，使用[::]
-                    sed -i "/listen =/ c\\listen = \"[::]:$current_listen_port\"" "${REALM_DIR}/config.toml"
-                else
-                    # IPv4 目标，使用0.0.0.0
-                    sed -i "/listen =/ c\\listen = \"0.0.0.0:$current_listen_port\"" "${REALM_DIR}/config.toml"
-                fi
+                config+="\nlisten = \"$listen_ip:$port\""
             else
-                echo "无效的选择，保持原配置"
+                # 分割输出以获取网卡名称和IP地址数组
+                IFS=';' read -ra parts <<< "$output"
+                IFS=' ' read -ra interfaces <<< "${parts[0]}"
+                
+                if [[ ${#interfaces[@]} -eq 0 ]]; then
+                    echo "未找到可用网卡，使用默认IP地址监听"
+                    if [[ "$target_ip" =~ : ]]; then
+                        listen_ip="[::]"  # IPv6 默认值
+                    else
+                        listen_ip="0.0.0.0"  # IPv4 默认值
+                    fi
+                    config+="\nlisten = \"$listen_ip:$port\""
+                else
+                    # 用户选择网卡
+                    interface_choice=$(read_input "请选择网卡接口 (输入数字): ")
+                    if [[ $interface_choice =~ ^[0-9]+$ ]] && [ $interface_choice -ge 1 ] && [ $interface_choice -le ${#interfaces[@]} ]; then
+                        # 数组索引从0开始，但显示从1开始
+                        listen_interface=${interfaces[$((interface_choice-1))]}
+                        # 根据目标IP类型设置默认监听IP
+                        if [[ "$target_ip" =~ : ]]; then
+                            listen_ip="[::]"  # IPv6 默认值
+                        else
+                            listen_ip="0.0.0.0"  # IPv4 默认值
+                        fi
+                        config+="\nlisten = \"$listen_ip:$port\""
+                        config+="\nlisten_interface = \"$listen_interface\""
+                    else
+                        echo "无效的选择，使用默认IP地址监听"
+                        if [[ "$target_ip" =~ : ]]; then
+                            listen_ip="[::]"  # IPv6 默认值
+                        else
+                            listen_ip="0.0.0.0"  # IPv4 默认值
+                        fi
+                        config+="\nlisten = \"$listen_ip:$port\""
+                    fi
+                fi
             fi
         fi
 
@@ -795,14 +801,16 @@ add_forward() {
                 fi
             elif [[ $bind_type == "2" ]]; then
                 echo "可用的网络接口："
+                # 获取网卡信息
                 output=$(get_interfaces_with_ips)
                 
+                # 检查输出是否为空
                 if [[ -z "$output" ]]; then
                     echo "未找到可用网卡，跳过绑定"
                     continue
                 fi
                 
-                # 分割输出以获取网卡名称和IP地址数组
+                # 分割输出以获取网卡名称
                 IFS=';' read -ra parts <<< "$output"
                 IFS=' ' read -ra interfaces <<< "${parts[0]}"
                 
@@ -811,6 +819,7 @@ add_forward() {
                     continue
                 fi
                 
+                # 用户选择网卡
                 interface_choice=$(read_input "请选择网络接口 (输入数字): ")
                 if [[ $interface_choice =~ ^[0-9]+$ ]] && [ $interface_choice -ge 1 ] && [ $interface_choice -le ${#interfaces[@]} ]; then
                     interface=${interfaces[$((interface_choice-1))]}

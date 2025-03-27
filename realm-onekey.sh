@@ -429,86 +429,61 @@ get_interfaces_with_ips() {
     local interfaces=()
     local interface_ips=()
 
-    # 检查ifconfig命令是否可用
-    if command -v ifconfig &> /dev/null; then
-        # 使用ifconfig获取所有网络接口（包括别名接口）
-        while IFS= read -r line; do
-            if [[ $line =~ ^([a-zA-Z0-9:._-]+)[[:space:]] ]]; then
-                local interface="${BASH_REMATCH[1]}"
-
-                # 跳过lo接口
-                if [[ "$interface" == "lo" ]]; then
-                    continue
-                fi
-
-                # 获取接口的IP地址
-                local ip_addr=$(ifconfig "$interface" | grep -w inet | awk '{print $2}')
-
-                # 如果有IPv4地址
-                if [[ -n "$ip_addr" ]]; then
-                    interfaces+=("$interface")
-                    interface_ips+=("$ip_addr")
-                else
-                    # 尝试获取IPv6地址
-                    local ipv6=$(ifconfig "$interface" | grep -w inet6 | grep -v "scope link" | awk '{print $2}')
-                    if [[ -n "$ipv6" ]]; then
-                        interfaces+=("$interface")
-                        interface_ips+=("$ipv6")
-                    fi
-                fi
-            fi
-        done < <(ifconfig -a | grep -E "^[a-zA-Z0-9:._-]+")
-    else
-        # 回退到使用ip命令
-        # 首先获取所有活动的网络接口名称（包括别名）
-        local all_interfaces=$(ip -o link show | grep -v "lo:" | awk '{print $2}' | sed 's/://' | sed 's/@.*//')
-
-        # 遍历所有网络接口获取IP地址
-        for interface in $all_interfaces; do
-            # 跳过loopback接口
-            if [[ "$interface" == "lo" ]]; then
-                continue
-            fi
-
-            # 尝试获取IPv4地址
-            local ipv4=$(ip -4 addr show dev "$interface" 2>/dev/null | grep -w inet | head -n 1 | awk '{print $2}' | cut -d/ -f1)
-
-            # 如果有IPv4地址
-            if [[ -n "$ipv4" ]]; then
+    # 获取所有网卡（基本网卡和别名网卡）
+    mapfile -t all_interfaces < <(ip link show | grep -v -E 'lo:|^ ' | awk -F': ' '{print $2}' | cut -d '@' -f1)
+    
+    for interface in "${all_interfaces[@]}"; do
+        # 获取IPv4地址
+        local ipv4=$(ip -4 addr show dev "$interface" 2>/dev/null | grep -w "inet" | head -n 1 | awk '{print $2}' | cut -d/ -f1)
+        
+        # 如果有IPv4地址，添加到列表
+        if [[ -n "$ipv4" ]]; then
+            interfaces+=("$interface")
+            interface_ips+=("$ipv4")
+        else
+            # 如果没有IPv4地址，尝试获取IPv6地址
+            local ipv6=$(ip -6 addr show dev "$interface" 2>/dev/null | grep -v "scope link" | grep -w "inet6" | head -n 1 | awk '{print $2}' | cut -d/ -f1)
+            if [[ -n "$ipv6" ]]; then
                 interfaces+=("$interface")
-                interface_ips+=("$ipv4")
-            else
-                # 尝试获取非链路本地IPv6地址
-                local ipv6=$(ip -6 addr show dev "$interface" 2>/dev/null | grep -v "scope link" | grep -w inet6 | head -n 1 | awk '{print $2}' | cut -d/ -f1)
-
-                # 如果有IPv6地址
-                if [[ -n "$ipv6" ]]; then
-                    interfaces+=("$interface")
-                    interface_ips+=("$ipv6")
+                interface_ips+=("$ipv6")
+            fi
+        fi
+    done
+    
+    # 获取别名接口（带冒号的），确保这些也被包含
+    while IFS= read -r line; do
+        # 提取别名接口名和IP
+        local alias_interface=$(echo "$line" | awk '{print $2}')
+        local alias_ip=$(echo "$line" | awk '{print $4}' | cut -d/ -f1)
+        
+        # 确保接口名是别名格式且不是lo接口
+        if [[ "$alias_interface" == *:* && "$alias_interface" != lo* ]]; then
+            # 检查是否已存在
+            local found=0
+            for i in "${!interfaces[@]}"; do
+                if [[ "${interfaces[i]}" == "$alias_interface" ]]; then
+                    found=1
+                    break
                 fi
+            done
+            
+            # 如果不存在，则添加
+            if [[ $found -eq 0 && -n "$alias_ip" ]]; then
+                interfaces+=("$alias_interface")
+                interface_ips+=("$alias_ip")
             fi
-        done
-
-        # 获取别名接口
-        while IFS= read -r line; do
-            local interface_name=$(echo "$line" | awk '{print $2}' | sed 's/://')
-            local ip_addr=$(echo "$line" | awk '{print $4}' | cut -d/ -f1)
-
-            # 确保是别名接口 (包含冒号)
-            if [[ "$interface_name" == *:* ]]; then
-                interfaces+=("$interface_name")
-                interface_ips+=("$ip_addr")
-            fi
-        done < <(ip -o addr show | grep "inet " | grep -v "scope host lo")
-    fi
-
+        fi
+    done < <(ip -o addr show | grep "inet ")
+    
     # 打印网卡和IP列表
     if [[ ${#interfaces[@]} -gt 0 ]]; then
         for i in "${!interfaces[@]}"; do
             echo "$((i+1)). ${interfaces[i]} (${interface_ips[i]})"
         done
+    else
+        echo "未找到可用网卡"
     fi
-
+    
     # 以特殊格式返回结果，方便后续处理
     echo "${interfaces[*]}" ";" "${interface_ips[*]}"
 }
@@ -791,36 +766,34 @@ add_forward() {
             interface_names=(${parts[0]})
 
             if [[ ${#interface_names[@]} -eq 0 ]]; then
-                echo "未找到可用网卡，使用默认IP监听"
-                if [[ "$target_ip" =~ : ]]; then
-                    listen_ip="[::]"  # IPv6 默认值
+                echo "未找到可用网卡，取消修改"
+                return
+            fi
+
+            # 用户选择网卡
+            interface_choice=$(read_input "请选择网卡接口 (输入数字): ")
+            if [[ $interface_choice =~ ^[0-9]+$ ]] && [ $interface_choice -ge 1 ] && [ $interface_choice -le ${#interface_names[@]} ]; then
+                new_listen_interface=${interface_names[$((interface_choice-1))]}
+
+                # 查找是否已有listen_interface行
+                if grep -q "listen_interface" <(echo "$rule_content"); then
+                    # 更新现有行
+                    sed -i "/listen_interface =/ c\\listen_interface = \"$new_listen_interface\"" "${REALM_DIR}/config.toml"
                 else
-                    listen_ip="0.0.0.0"  # IPv4 默认值
+                    # 在listen行后添加新行
+                    sed -i "/listen =/ a\\listen_interface = \"$new_listen_interface\"" "${REALM_DIR}/config.toml"
                 fi
-                config+="\nlisten = \"$listen_ip:$port\""
+
+                # 确保listen地址为正确的通配符地址
+                if [[ "${current_remote}" =~ .*:.* && ! "${current_remote}" =~ [0-9]+\.[0-9]+ ]]; then
+                    # IPv6 目标，使用[::]
+                    sed -i "/listen =/ c\\listen = \"[::]:$current_listen_port\"" "${REALM_DIR}/config.toml"
+                else
+                    # IPv4 目标，使用0.0.0.0
+                    sed -i "/listen =/ c\\listen = \"0.0.0.0:$current_listen_port\"" "${REALM_DIR}/config.toml"
+                fi
             else
-                # 用户选择网卡
-                interface_choice=$(read_input "请选择网卡接口 (输入数字): ")
-                if [[ $interface_choice =~ ^[0-9]+$ ]] && [ $interface_choice -ge 1 ] && [ $interface_choice -le ${#interface_names[@]} ]; then
-                    # 数组索引从0开始，但显示从1开始
-                    listen_interface=${interface_names[$((interface_choice-1))]}
-                    # 根据目标IP类型设置默认监听IP
-                    if [[ "$target_ip" =~ : ]]; then
-                        listen_ip="[::]"  # IPv6 默认值
-                    else
-                        listen_ip="0.0.0.0"  # IPv4 默认值
-                    fi
-                    config+="\nlisten = \"$listen_ip:$port\""
-                    config+="\nlisten_interface = \"$listen_interface\""
-                else
-                    echo "无效的选择，使用默认IP地址监听"
-                    if [[ "$target_ip" =~ : ]]; then
-                        listen_ip="[::]"  # IPv6 默认值
-                    else
-                        listen_ip="0.0.0.0"  # IPv4 默认值
-                    fi
-                    config+="\nlisten = \"$listen_ip:$port\""
-                fi
+                echo "无效的选择，保持原配置"
             fi
         fi
 
@@ -829,67 +802,6 @@ add_forward() {
             target_ip="[$target_ip]"
         fi
         config+="\nremote = \"$target_ip:$port\""
-
-        # 处理绑定选项
-        read -p "是否绑定特定IP或网络接口用于出站连接? (y/N): " bind_option
-        if [[ $bind_option == "Y" || $bind_option == "y" ]]; then
-            read -p "请选择绑定选项 (1: 特定IP, 2: 网络接口): " bind_type
-            if [[ $bind_type == "1" ]]; then
-                echo "可用的IP地址："
-                mapfile -t all_ips < <(get_all_ips)
-
-                ip_choice=$(read_input "请选择IP地址 (输入数字) 或直接输入IP: ")
-                if [[ $ip_choice =~ ^[0-9]+$ ]] && [ $ip_choice -le ${#all_ips[@]} ]; then
-                    bind_ip=${all_ips[$((ip_choice-1))]}
-                else
-                    if validate_ip "$ip_choice"; then
-                        bind_ip=$ip_choice
-                    else
-                        echo "无效的 IP 地址，跳过绑定"
-                        bind_ip=""
-                    fi
-                fi
-
-                if [ ! -z "$bind_ip" ]; then
-                    if [[ $bind_ip =~ : ]]; then
-                        bind_ip="[$bind_ip]"
-                    fi
-                    config+="\nthrough = \"$bind_ip\""
-                fi
-            elif [[ $bind_type == "2" ]]; then
-                echo "可用的网络接口："
-                # 获取网卡和IP信息
-                local interfaces_output=$(get_interfaces_with_ips)
-                local interfaces_list=$(echo "$interfaces_output" | grep -E '^[0-9]+\.')
-                local interfaces_data=$(echo "$interfaces_output" | grep -v -E '^[0-9]+\.')
-
-                # 打印网卡列表
-                if [[ -n "$interfaces_list" ]]; then
-                    echo "$interfaces_list"
-                else
-                    echo "未找到可用网卡，跳过绑定"
-                    continue
-                fi
-
-                # 解析网卡数据
-                IFS=';' read -ra parts <<< "$interfaces_data"
-                IFS=' ' read -ra interface_names <<< "${parts[0]//,/ }"
-
-                if [[ ${#interface_names[@]} -eq 0 ]]; then
-                    echo "未找到可用网卡，跳过绑定"
-                    continue
-                fi
-
-                # 用户选择网卡
-                interface_choice=$(read_input "请选择网络接口 (输入数字): ")
-                if [[ $interface_choice =~ ^[0-9]+$ ]] && [ $interface_choice -ge 1 ] && [ $interface_choice -le ${#interface_names[@]} ]; then
-                    interface=${interface_names[$((interface_choice-1))]}
-                    config+="\ninterface = \"$interface\""
-                else
-                    echo "无效的选项，不进行绑定"
-                fi
-            fi
-        fi
 
         sed -i '/# 转发规则将在此处添加/i\'"$config" "${REALM_DIR}/config.toml"
         echo "转发规则已添加："

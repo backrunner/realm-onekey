@@ -125,7 +125,7 @@ install_dependencies() {
 echo -e "\033%G"  # 设置终端字符集
 
 # 定义脚本版本
-SCRIPT_VERSION="20250220"
+SCRIPT_VERSION="20250328"
 
 # 定义 realm 版本变量
 REALM_VERSION="v2.7.0"  # 预设版本
@@ -424,6 +424,45 @@ get_all_ips() {
     echo "${ipv4_addrs[@]}" "${ipv6_addrs[@]}"
 }
 
+# 获取网卡及其主IP地址
+get_interfaces_with_ips() {
+    local interfaces=()
+    local interface_ips=()
+
+    # 读取所有网卡名称及其IPv4地址
+    while IFS= read -r line; do
+        local interface=$(echo "$line" | awk '{print $2}')
+        interface=${interface%:}  # 移除冒号
+
+        # 排除lo接口
+        if [[ "$interface" != "lo" ]]; then
+            local ip=$(ip -4 addr show dev "$interface" | grep -oP 'inet \K[0-9.]+')
+
+            # 如果网卡有IP地址则添加
+            if [[ -n "$ip" ]]; then
+                interfaces+=("$interface")
+                interface_ips+=("$ip")
+            fi
+        fi
+    done < <(ip -o link show)
+
+    # 输出结果
+    for i in "${!interfaces[@]}"; do
+        echo "$((i+1)). ${interfaces[i]} (${interface_ips[i]})"
+    done
+
+    # 返回结果作为数组
+    echo "${interfaces[@]}" ";" "${interface_ips[@]}"
+}
+
+# 添加读取用户输入的函数（如果未定义）
+read_input() {
+    local prompt="$1"
+    local input=""
+    read -r -p "$prompt" input
+    echo "$input"
+}
+
 # 修改部署函数中的版本使用
 deploy_realm() {
     # 获取最新版本
@@ -602,65 +641,100 @@ add_forward() {
             fi
         done
 
-        listen_ip_option=$(read_input "是否指定监听IP? (默认: IPv4为0.0.0.0，IPv6为[::]) (y/N): ")
+        # 设置监听选项，让用户选择是使用IP还是网卡
+        echo "请选择监听方式:"
+        echo "1. 使用特定IP地址监听"
+        echo "2. 使用特定网卡接口监听"
+        listen_option=$(read_input "请选择 (1/2): ")
 
-        # 根据目标IP类型设置默认监听IP
-        if [[ "$target_ip" =~ : ]]; then
-            listen_ip="[::]"  # IPv6 默认值
-        else
-            listen_ip="0.0.0.0"  # IPv4 默认值
-        fi
+        config="\n[[endpoints]]"
+        listen_interface=""
 
-        if [[ $listen_ip_option == "Y" || $listen_ip_option == "y" ]]; then
-            echo "可用的IP地址："
-            # 根据目标IP类型只显示相应的IP版本
+        if [[ $listen_option == "1" ]]; then
+            # 使用IP地址监听
+            listen_ip_option=$(read_input "是否指定监听IP? (默认: IPv4为0.0.0.0，IPv6为[::]) (y/N): ")
+
+            # 根据目标IP类型设置默认监听IP
             if [[ "$target_ip" =~ : ]]; then
-                # 只显示IPv6地址
-                echo "IPv6 地址:"
-                mapfile -t all_ips < <(ip -6 addr show | grep "inet6" | grep -v "fe80" | awk '{print $2}' | cut -d'/' -f1)
-                all_ips+=("[::]")
+                listen_ip="[::]"  # IPv6 默认值
             else
-                # 只显示IPv4地址
-                echo "IPv4 地址:"
-                mapfile -t all_ips < <(ip -4 addr show | grep "inet" | awk '{print $2}' | cut -d'/' -f1)
-                all_ips+=("0.0.0.0")
+                listen_ip="0.0.0.0"  # IPv4 默认值
             fi
 
-            for i in "${!all_ips[@]}"; do
-                echo "$((i+1)). ${all_ips[i]}"
-            done
-
-            ip_choice=$(read_input "请选择监听IP (输入数字) 或直接输入IP: ")
-            if [[ $ip_choice =~ ^[0-9]+$ ]] && [ $ip_choice -le ${#all_ips[@]} ]; then
-                listen_ip=${all_ips[$((ip_choice-1))]}
-            else
-                # 验证手动输入的 IP 与目标 IP 版本是否匹配
-                if validate_ip "$ip_choice"; then
-                    if [[ "$target_ip" =~ : ]] && [[ "$ip_choice" =~ : ]]; then
-                        listen_ip=$ip_choice
-                    elif [[ ! "$target_ip" =~ : ]] && [[ ! "$ip_choice" =~ : ]]; then
-                        listen_ip=$ip_choice
-                    else
-                        echo "监听IP版本与目标IP版本不匹配，使用默认值"
-                    fi
+            if [[ $listen_ip_option == "Y" || $listen_ip_option == "y" ]]; then
+                echo "可用的IP地址："
+                # 根据目标IP类型只显示相应的IP版本
+                if [[ "$target_ip" =~ : ]]; then
+                    # 只显示IPv6地址
+                    echo "IPv6 地址:"
+                    mapfile -t all_ips < <(ip -6 addr show | grep "inet6" | grep -v "fe80" | awk '{print $2}' | cut -d'/' -f1)
+                    all_ips+=("[::]")
                 else
-                    echo "无效的 IP 地址，使用默认值"
+                    # 只显示IPv4地址
+                    echo "IPv4 地址:"
+                    mapfile -t all_ips < <(ip -4 addr show | grep "inet" | awk '{print $2}' | cut -d'/' -f1)
+                    all_ips+=("0.0.0.0")
+                fi
+
+                for i in "${!all_ips[@]}"; do
+                    echo "$((i+1)). ${all_ips[i]}"
+                done
+
+                ip_choice=$(read_input "请选择监听IP (输入数字) 或直接输入IP: ")
+                if [[ $ip_choice =~ ^[0-9]+$ ]] && [ $ip_choice -le ${#all_ips[@]} ]; then
+                    listen_ip=${all_ips[$((ip_choice-1))]}
+                else
+                    # 验证手动输入的 IP 与目标 IP 版本是否匹配
+                    if validate_ip "$ip_choice"; then
+                        if [[ "$target_ip" =~ : ]] && [[ "$ip_choice" =~ : ]]; then
+                            listen_ip=$ip_choice
+                        elif [[ ! "$target_ip" =~ : ]] && [[ ! "$ip_choice" =~ : ]]; then
+                            listen_ip=$ip_choice
+                        else
+                            echo "监听IP版本与目标IP版本不匹配，使用默认值"
+                        fi
+                    else
+                        echo "无效的 IP 地址，使用默认值"
+                    fi
                 fi
             fi
+
+            # IPv6 地址需要用方括号括起来
+            if [[ "$listen_ip" =~ : ]] && [[ "$listen_ip" != \[*\] ]]; then
+                listen_ip="[$listen_ip]"
+            fi
+
+            config+="\nlisten = \"$listen_ip:$port\""
+        else
+            # 使用网卡接口监听
+            echo "可用的网卡接口："
+            # 获取网卡和IP信息
+            output=$(get_interfaces_with_ips)
+            # 分割输出以获取网卡名称和IP地址数组
+            IFS=';' read -ra parts <<< "$output"
+            IFS=' ' read -ra interfaces <<< "${parts[0]}"
+
+            # 用户选择网卡
+            interface_choice=$(read_input "请选择网卡接口 (输入数字): ")
+            if [[ $interface_choice =~ ^[0-9]+$ ]] && [ $interface_choice -le ${#interfaces[@]} ]; then
+                # 数组索引从0开始，但显示从1开始
+                listen_interface=${interfaces[$((interface_choice-1))]}
+                config+="\nlisten = \"0.0.0.0:$port\""
+                config+="\nlisten_interface = \"$listen_interface\""
+            else
+                echo "无效的选择，使用默认IP (0.0.0.0)"
+                config+="\nlisten = \"0.0.0.0:$port\""
+            fi
         fi
 
-        # IPv6 地址需要用方括号括起来
-        if [[ "$listen_ip" =~ : ]] && [[ "$listen_ip" != \[*\] ]]; then
-            listen_ip="[$listen_ip]"
-        fi
+        # 添加remote配置
         if [[ "$target_ip" =~ : ]] && [[ "$target_ip" != \[*\] ]]; then
             target_ip="[$target_ip]"
         fi
-
-        config="\n[[endpoints]]\nlisten = \"$listen_ip:$port\"\nremote = \"$target_ip:$port\""
+        config+="\nremote = \"$target_ip:$port\""
 
         # 处理绑定选项
-        read -p "是否绑定特定IP或网络接口? (y/N): " bind_option
+        read -p "是否绑定特定IP或网络接口用于出站连接? (y/N): " bind_option
         if [[ $bind_option == "Y" || $bind_option == "y" ]]; then
             read -p "请选择绑定选项 (1: 特定IP, 2: 网络接口): " bind_type
             if [[ $bind_type == "1" ]]; then
@@ -687,7 +761,10 @@ add_forward() {
                 fi
             elif [[ $bind_type == "2" ]]; then
                 echo "可用的网络接口："
-                interfaces=($(ip -o link show | awk -F': ' '{print $2}'))
+                output=$(get_interfaces_with_ips)
+                IFS=';' read -ra parts <<< "$output"
+                IFS=' ' read -ra interfaces <<< "${parts[0]}"
+
                 for i in "${!interfaces[@]}"; do
                     echo "$((i+1)). ${interfaces[i]}"
                 done
@@ -704,7 +781,17 @@ add_forward() {
 
         sed -i '/# 转发规则将在此处添加/i\'"$config" "${REALM_DIR}/config.toml"
         echo "转发规则已添加："
-        echo "监听地址: $listen_ip:$port"
+
+        if [ -z "$listen_interface" ]; then
+            if [[ $listen_option == "1" ]]; then
+                echo "监听地址: $listen_ip:$port"
+            else
+                echo "监听地址: 0.0.0.0:$port (未选择特定网卡)"
+            fi
+        else
+            echo "监听地址: 0.0.0.0:$port (网卡: $listen_interface)"
+        fi
+
         echo "转发地址: $target_ip:$port"
 
         # 添加自动重启服务的逻辑
@@ -726,33 +813,7 @@ add_forward() {
 # 添加修改转发的函数
 modify_forward() {
     echo "当前转发规则："
-    local IFS=$'\n'
-    local lines=($(grep -n '\[\[endpoints\]\]' "${REALM_DIR}/config.toml"))
-    if [ ${#lines[@]} -eq 0 ]; then
-        echo "没有发现任何转发规则。"
-        return
-    fi
-
-    # 存储所有转发规则的信息
-    declare -a rules_info
-    local rule_count=0
-    local current_section=""
-    local listen_addr=""
-    local remote_addr=""
-    local section_start=0
-
-    while IFS= read -r line || [ -n "$line" ]; do
-        if [[ $line == *"[[endpoints]]"* ]]; then
-            ((rule_count++))
-            section_start=$(grep -n "$line" "${REALM_DIR}/config.toml" | cut -d: -f1)
-            current_section=$rule_count
-        elif [[ $line == *"listen ="* ]] && [ -n "$current_section" ]; then
-            listen_addr=$(echo $line | grep -oP 'listen = "\K[^"]+')
-            rules_info+=("$section_start|$listen_addr")
-            echo "$rule_count. 监听: $listen_addr -> 转发: $remote_addr"
-            current_section=""
-        fi
-    done < "${REALM_DIR}/config.toml"
+    list_forwards
 
     echo "请输入要修改的转发规则序号，直接按回车返回主菜单。"
     read -r -p "选择: " choice
@@ -760,83 +821,214 @@ modify_forward() {
         return
     fi
 
-    if ! [[ $choice =~ ^[0-9]+$ ]] || [ $choice -lt 1 ] || [ $choice -gt $rule_count ]; then
+    # 提取规则信息
+    local rule_sections=($(grep -n '\[\[endpoints\]\]' "${REALM_DIR}/config.toml" | cut -d: -f1))
+
+    if ! [[ $choice =~ ^[0-9]+$ ]] || [ $choice -lt 1 ] || [ $choice -gt ${#rule_sections[@]} ]; then
         echo "无效的选择。"
         return
     fi
 
-    # 获取选中规则的信息
-    local selected_rule=${rules_info[$((choice-1))]}
-    local rule_line=${selected_rule%|*}
-    local current_listen=${selected_rule#*|}
+    # 确定所选规则的开始行
+    local start_line=${rule_sections[$((choice-1))]}
+    local end_line
 
-    # 解析当前配置
-    local current_listen_ip=${current_listen%:*}
-    local current_listen_port=${current_listen#*:}
-    # 移除 IPv6 地址的方括号
-    current_listen_ip=${current_listen_ip#[}
-    current_listen_ip=${current_listen_ip%]}
+    # 确定该规则的结束行
+    if [ $choice -lt ${#rule_sections[@]} ]; then
+        end_line=$((${rule_sections[$choice]}-1))
+    else
+        # 如果是最后一个规则，使用文件末尾
+        end_line=$(wc -l < "${REALM_DIR}/config.toml")
+    fi
+
+    # 提取该规则的所有配置
+    local rule_content=$(sed -n "${start_line},${end_line}p" "${REALM_DIR}/config.toml")
+
+    # 解析现有配置
+    local current_listen=$(echo "$rule_content" | grep 'listen =' | grep -oP 'listen = "\K[^"]+')
+    local current_remote=$(echo "$rule_content" | grep 'remote =' | grep -oP 'remote = "\K[^"]+')
+    local current_listen_interface=$(echo "$rule_content" | grep 'listen_interface =' | grep -oP 'listen_interface = "\K[^"]+')
+
+    # 解析监听地址
+    local current_listen_ip=""
+    local current_listen_port=""
+
+    if [ -n "$current_listen" ]; then
+        current_listen_ip=${current_listen%:*}
+        current_listen_port=${current_listen#*:}
+        # 移除 IPv6 地址的方括号
+        current_listen_ip=${current_listen_ip#[}
+        current_listen_ip=${current_listen_ip%]}
+    fi
 
     echo "当前配置："
-    echo "监听地址: $current_listen_ip:$current_listen_port"
+    if [ -n "$current_listen_interface" ]; then
+        echo "监听网卡: $current_listen_interface"
+    fi
+    echo "监听地址: $current_listen"
+    echo "转发地址: $current_remote"
 
     # 询问修改项
-    read -r -p "是否修改监听IP? (当前: $current_listen_ip) (y/N): " modify_listen_ip
-    if [[ $modify_listen_ip == [Yy] ]]; then
-        echo "选择新的监听IP:"
-        echo "1. 选择本地IP"
-        echo "2. 手动输入IP"
-        read -r -p "请选择 (1/2): " ip_choice_method
+    echo "请选择要修改的内容:"
+    echo "1. 修改监听方式 (IP或网卡)"
+    echo "2. 修改监听端口"
+    echo "3. 修改目标地址"
+    echo "0. 取消修改"
 
-        case $ip_choice_method in
-            1)
+    read -r -p "请选择: " modify_choice
+
+    case $modify_choice in
+        1)
+            # 修改监听方式
+            echo "请选择新的监听方式:"
+            echo "1. 使用特定IP地址监听"
+            echo "2. 使用特定网卡接口监听"
+            read -r -p "请选择 (1/2): " new_listen_mode
+
+            # 备份配置
+            cp "${REALM_DIR}/config.toml" "${REALM_DIR}/config.toml.bak"
+
+            if [[ $new_listen_mode == "1" ]]; then
+                # 使用IP地址监听，移除网卡监听配置
+                sed -i "/listen_interface/d" "${REALM_DIR}/config.toml"
+
+                # 选择新的IP地址
                 echo "可用的IP地址："
-                mapfile -t all_ips < <(get_all_ips)
-                ip_choice=$(read_input "请选择IP (输入数字): ")
+                if [[ "${current_remote}" =~ .*:.* && ! "${current_remote}" =~ [0-9]+\.[0-9]+ ]]; then
+                    # IPv6 目标地址
+                    echo "IPv6 地址:"
+                    mapfile -t all_ips < <(ip -6 addr show | grep "inet6" | grep -v "fe80" | awk '{print $2}' | cut -d'/' -f1)
+                    all_ips+=("[::]")
+                else
+                    # IPv4 目标地址
+                    echo "IPv4 地址:"
+                    mapfile -t all_ips < <(ip -4 addr show | grep "inet" | awk '{print $2}' | cut -d'/' -f1)
+                    all_ips+=("0.0.0.0")
+                fi
+
+                for i in "${!all_ips[@]}"; do
+                    echo "$((i+1)). ${all_ips[i]}"
+                done
+
+                ip_choice=$(read_input "请选择监听IP (输入数字) 或直接输入IP: ")
                 if [[ $ip_choice =~ ^[0-9]+$ ]] && [ $ip_choice -le ${#all_ips[@]} ]; then
-                    current_listen_ip=${all_ips[$((ip_choice-1))]}
+                    new_listen_ip=${all_ips[$((ip_choice-1))]}
                 else
-                    echo "无效的选择，保持原IP"
+                    if validate_ip "$ip_choice"; then
+                        new_listen_ip=$ip_choice
+                    else
+                        echo "无效的 IP 地址，使用默认值"
+                        if [[ "${current_remote}" =~ .*:.* && ! "${current_remote}" =~ [0-9]+\.[0-9]+ ]]; then
+                            new_listen_ip="[::]"
+                        else
+                            new_listen_ip="0.0.0.0"
+                        fi
+                    fi
                 fi
-                ;;
-            2)
-                read -r -p "请输入新的IP: " new_ip
-                if validate_ip "$new_ip"; then
-                    current_listen_ip=$new_ip
-                else
-                    echo "无效的IP地址格式，保持原IP"
-                fi
-                ;;
-            *)
-                echo "无效的选择，保持原IP"
-                ;;
-        esac
-    fi
 
-    read -r -p "是否修改监听端口? (当前: $current_listen_port) (y/N): " modify_listen_port
-    if [[ $modify_listen_port == [Yy] ]]; then
-        while true; do
-            read -r -p "请输入新的端口号: " new_port
-            if [[ $new_port =~ ^[0-9]+$ ]] && [ $new_port -ge 1 ] && [ $new_port -le 65535 ]; then
-                current_listen_port=$new_port
-                break
+                # IPv6 地址需要用方括号括起来
+                if [[ "$new_listen_ip" =~ : ]] && [[ "$new_listen_ip" != \[*\] ]]; then
+                    new_listen_ip="[$new_listen_ip]"
+                fi
+
+                # 更新配置文件中的监听地址
+                sed -i "/listen =/ c\\listen = \"$new_listen_ip:$current_listen_port\"" "${REALM_DIR}/config.toml"
             else
-                echo "无效的端口号，请输入 1-65535 之间的数字"
+                # 使用网卡接口监听
+                echo "可用的网卡接口："
+                # 获取网卡和IP信息
+                output=$(get_interfaces_with_ips)
+                # 分割输出以获取网卡名称和IP地址数组
+                IFS=';' read -ra parts <<< "$output"
+                IFS=' ' read -ra interfaces <<< "${parts[0]}"
+
+                for i in "${!interfaces[@]}"; do
+                    echo "$((i+1)). ${interfaces[i]}"
+                done
+
+                # 用户选择网卡
+                interface_choice=$(read_input "请选择网卡接口 (输入数字): ")
+                if [[ $interface_choice =~ ^[0-9]+$ ]] && [ $interface_choice -le ${#interfaces[@]} ]; then
+                    new_listen_interface=${interfaces[$((interface_choice-1))]}
+
+                    # 查找是否已有listen_interface行
+                    if grep -q "listen_interface" <(echo "$rule_content"); then
+                        # 更新现有行
+                        sed -i "/listen_interface =/ c\\listen_interface = \"$new_listen_interface\"" "${REALM_DIR}/config.toml"
+                    else
+                        # 在listen行后添加新行
+                        sed -i "/listen =/ a\\listen_interface = \"$new_listen_interface\"" "${REALM_DIR}/config.toml"
+                    fi
+
+                    # 确保listen地址为0.0.0.0
+                    if [[ "${current_remote}" =~ .*:.* && ! "${current_remote}" =~ [0-9]+\.[0-9]+ ]]; then
+                        # IPv6 目标，使用[::]
+                        sed -i "/listen =/ c\\listen = \"[::]:$current_listen_port\"" "${REALM_DIR}/config.toml"
+                    else
+                        # IPv4 目标，使用0.0.0.0
+                        sed -i "/listen =/ c\\listen = \"0.0.0.0:$current_listen_port\"" "${REALM_DIR}/config.toml"
+                    fi
+                else
+                    echo "无效的选择，保持原配置"
+                fi
             fi
-        done
-    fi
+            ;;
+        2)
+            # 修改监听端口
+            while true; do
+                read -r -p "请输入新的端口号: " new_port
+                if [[ $new_port =~ ^[0-9]+$ ]] && [ $new_port -ge 1 ] && [ $new_port -le 65535 ]; then
+                    # 更新配置文件中的端口
+                    if [[ -n "$current_listen" ]]; then
+                        new_listen="${current_listen%:*}:$new_port"
+                        sed -i "/listen =/ c\\listen = \"$new_listen\"" "${REALM_DIR}/config.toml"
+                    fi
+                    break
+                else
+                    echo "无效的端口号，请输入 1-65535 之间的数字"
+                fi
+            done
+            ;;
+        3)
+            # 修改目标地址
+            while true; do
+                target_ip=$(read_input "请输入新的目标IP (IPv4/IPv6): ")
+                if validate_ip "$target_ip"; then
+                    break
+                else
+                    echo "无效的 IP 地址格式，请重新输入"
+                fi
+            done
 
-    # 处理 IPv6 地址的方括号
-    if [[ $current_listen_ip =~ : ]]; then
-        current_listen_ip="[$current_listen_ip]"
-    fi
+            # 获取端口
+            while true; do
+                port=$(read_input "请输入新的目标端口: ")
+                if [[ $port =~ ^[0-9]+$ ]] && [ $port -ge 1 ] && [ $port -le 65535 ]; then
+                    break
+                else
+                    echo "无效的端口号，请输入 1-65535 之间的数字"
+                fi
+            done
 
-    # 更新配置文件
-    local new_listen="listen = \"$current_listen_ip:$current_listen_port"
-    sed -i "$((rule_line+1))c\\$new_listen" "${REALM_DIR}/config.toml"
+            # IPv6 地址需要用方括号括起来
+            if [[ "$target_ip" =~ : ]] && [[ "$target_ip" != \[*\] ]]; then
+                target_ip="[$target_ip]"
+            fi
 
-    echo "转发规则已更新："
-    echo "新的监听地址: $current_listen_ip:$current_listen_port"
+            # 更新配置文件中的目标地址
+            sed -i "/remote =/ c\\remote = \"$target_ip:$port\"" "${REALM_DIR}/config.toml"
+            ;;
+        0)
+            echo "取消修改。"
+            return
+            ;;
+        *)
+            echo "无效选项，取消修改。"
+            return
+            ;;
+    esac
+
+    echo "转发规则已更新"
 
     # 自动重启服务
     echo -e "${COLOR_BLUE}正在重启 realm 服务以应用新配置...${COLOR_RESET}"
@@ -1007,7 +1199,7 @@ list_forwards() {
     echo "==================="
 
     local IFS=$'\n'
-    local rules=($(grep -A 2 '^\[\[endpoints\]\]' "${REALM_DIR}/config.toml"))
+    local rules=($(grep -A 4 '^\[\[endpoints\]\]' "${REALM_DIR}/config.toml"))
 
     if [ ${#rules[@]} -eq 0 ]; then
         echo "没有找到任何转发规则。"
@@ -1015,27 +1207,66 @@ list_forwards() {
     fi
 
     local rule_count=0
-    for ((i=0; i<${#rules[@]}; i+=3)); do
-        if [[ "${rules[i]}" == "[[endpoints]]" ]]; then
-            ((rule_count++))
-            echo -e "\n规则 $rule_count:"
+    local in_rule=0
+    local rule_info=""
+    local listen=""
+    local remote=""
+    local listen_interface=""
+    local through=""
+    local interface=""
 
-            # 提取监听地址
-            local listen=$(echo "${rules[i+1]}" | grep -oP 'listen = "\K[^"]+')
-            echo "监听地址: $listen"
-
-            # 提取远程地址
-            local remote=$(echo "${rules[i+2]}" | grep -oP 'remote = "\K[^"]+')
-            echo "转发地址: $remote"
-
-            # 检查是否有额外的绑定设置
-            local through=$(grep -A 1 "remote = \"$remote\"" "${REALM_DIR}/config.toml" | grep 'through' | grep -oP 'through = "\K[^"]+')
-            local interface=$(grep -A 1 "remote = \"$remote\"" "${REALM_DIR}/config.toml" | grep 'interface' | grep -oP 'interface = "\K[^"]+')
-
-            [ ! -z "$through" ] && echo "绑定IP: $through"
-            [ ! -z "$interface" ] && echo "绑定接口: $interface"
+    while IFS= read -r line; do
+        if [[ "$line" == "[[endpoints]]" ]]; then
+            # 如果之前有规则信息，先输出
+            if [[ $in_rule -eq 1 ]]; then
+                ((rule_count++))
+                echo -e "\n规则 $rule_count:"
+                echo "$rule_info"
+                # 重置规则信息
+                rule_info=""
+            fi
+            in_rule=1
+            continue
         fi
-    done
+
+        if [[ $in_rule -eq 1 ]]; then
+            if [[ "$line" =~ listen[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+                listen="${BASH_REMATCH[1]}"
+                rule_info+="监听地址: $listen\n"
+            elif [[ "$line" =~ remote[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+                remote="${BASH_REMATCH[1]}"
+                rule_info+="转发地址: $remote\n"
+            elif [[ "$line" =~ listen_interface[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+                listen_interface="${BASH_REMATCH[1]}"
+                rule_info+="监听网卡: $listen_interface\n"
+            elif [[ "$line" =~ through[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+                through="${BASH_REMATCH[1]}"
+                rule_info+="绑定IP: $through\n"
+            elif [[ "$line" =~ interface[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+                interface="${BASH_REMATCH[1]}"
+                rule_info+="绑定接口: $interface\n"
+            elif [[ "$line" == "[[endpoints]]" ]]; then
+                # 处理下一个规则开始
+                ((rule_count++))
+                echo -e "\n规则 $rule_count:"
+                echo -e "$rule_info"
+                rule_info=""
+                listen=""
+                remote=""
+                listen_interface=""
+                through=""
+                interface=""
+            fi
+        fi
+    done < "${REALM_DIR}/config.toml"
+
+    # 输出最后一个规则
+    if [[ $in_rule -eq 1 && -n "$rule_info" ]]; then
+        ((rule_count++))
+        echo -e "\n规则 $rule_count:"
+        echo -e "$rule_info"
+    fi
+
     echo -e "\n==================="
 }
 

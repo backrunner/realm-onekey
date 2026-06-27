@@ -122,10 +122,6 @@ install_dependencies() {
     fi
 }
 
-if [ -t 1 ]; then
-    printf '\033%%G'  # 设置终端字符集
-fi
-
 # 定义脚本版本
 SCRIPT_VERSION="20260628"
 
@@ -133,6 +129,15 @@ SCRIPT_VERSION="20260628"
 REALM_VERSION="v2.7.0"  # 预设版本
 LATEST_VERSION=""       # 用于存储从 GitHub 获取的最新版本
 GITHUB_TIMEOUT=5       # GitHub API 请求超时时间（秒）
+PUBLIC_IP_TIMEOUT=3    # 公网 IP 归属地检测超时时间（秒）
+REALM_ASSET_NAME="realm-x86_64-unknown-linux-gnu.tar.gz"
+GITHUB_RELEASE_BASE="https://github.com/zhboner/realm/releases/download"
+GITHUB_MIRROR_PREFIXES=(
+    "${GITHUB_MIRROR_PREFIX:-}"
+    "https://gh-proxy.com/"
+    "https://gh.llkk.cc/"
+    "https://ghproxy.net/"
+)
 
 # 定义基础目录（在脚本最前面添加）
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
@@ -421,14 +426,95 @@ init_latest_version() {
     fi
 }
 
+is_realm_installed() {
+    [ -f "${REALM_DIR}/realm" ]
+}
+
+get_public_country_code() {
+    local country=""
+    local endpoints=(
+        "https://ipinfo.io/country"
+        "https://ifconfig.co/country-iso"
+        "https://ipapi.co/country/"
+    )
+
+    for endpoint in "${endpoints[@]}"; do
+        country=$(curl -fsSL -m "$PUBLIC_IP_TIMEOUT" "$endpoint" 2>/dev/null | tr -d '\r\n' | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+        if [[ "$country" =~ ^[A-Z]{2}$ ]]; then
+            echo "$country"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+is_china_public_ip() {
+    local country_code
+
+    country_code=$(get_public_country_code) || return 1
+    [ "$country_code" = "CN" ]
+}
+
+build_realm_download_url() {
+    local version="$1"
+    echo "${GITHUB_RELEASE_BASE}/${version}/${REALM_ASSET_NAME}"
+}
+
+download_realm_archive() {
+    local version="$1"
+    local output_file="${2:-realm.tar.gz}"
+    local origin_url
+    local download_url
+    local mirror_prefix
+    local -a download_urls=()
+    local -a mirror_urls=()
+
+    origin_url=$(build_realm_download_url "$version")
+    for mirror_prefix in "${GITHUB_MIRROR_PREFIXES[@]}"; do
+        if [ -n "$mirror_prefix" ]; then
+            mirror_urls+=("${mirror_prefix%/}/${origin_url}")
+        fi
+    done
+
+    if is_china_public_ip; then
+        echo -e "${COLOR_YELLOW}检测到当前公网 IP 位于中国大陆，优先使用 GitHub 公共镜像下载。${COLOR_RESET}"
+        download_urls=("${mirror_urls[@]}" "$origin_url")
+    else
+        download_urls=("$origin_url" "${mirror_urls[@]}")
+    fi
+
+    for download_url in "${download_urls[@]}"; do
+        if [ "$download_url" = "$origin_url" ]; then
+            echo -e "${COLOR_BLUE}尝试从 GitHub 官方地址下载...${COLOR_RESET}"
+        else
+            echo -e "${COLOR_BLUE}尝试从公共镜像下载...${COLOR_RESET}"
+        fi
+
+        if wget -O "$output_file" "$download_url"; then
+            return 0
+        fi
+
+        rm -f "$output_file"
+        echo -e "${COLOR_YELLOW}当前下载地址失败，继续尝试下一个地址...${COLOR_RESET}"
+    done
+
+    return 1
+}
+
 # 修改主菜单显示函数
 show_main_menu() {
     clear
     echo "欢迎使用 realm 管理脚本 (v$SCRIPT_VERSION)"
     echo "================="
-    echo "1. 服务管理"
-    echo "2. 转发管理"
-    echo "3. 系统维护"
+    if is_realm_installed; then
+        echo "1. 服务管理"
+        echo "2. 转发管理"
+        echo "3. 系统维护"
+    else
+        echo "1. 安装/部署 realm"
+        echo "2. 系统维护"
+    fi
     echo "0. 退出脚本"
     echo "================="
     echo -e "realm 状态：${realm_status_color}${realm_status}\033[0m"
@@ -660,7 +746,7 @@ deploy_realm() {
     cd "${REALM_DIR}"
 
     echo -e "${COLOR_BLUE}下载 realm ${deploy_version}...${COLOR_RESET}"
-    if ! wget -O realm.tar.gz "https://github.com/zhboner/realm/releases/download/${deploy_version}/realm-x86_64-unknown-linux-gnu.tar.gz"; then
+    if ! download_realm_archive "$deploy_version" "realm.tar.gz"; then
         echo -e "${COLOR_RED}下载失败${COLOR_RESET}"
         return 1
     fi
@@ -1400,8 +1486,7 @@ upgrade_realm() {
     rm -f realm-*  # 删除所有旧版本
 
     # 下载并安装新版本
-    wget -O realm.tar.gz "https://github.com/zhboner/realm/releases/download/${latest_version}/realm-x86_64-unknown-linux-gnu.tar.gz"
-    if [ $? -ne 0 ]; then
+    if ! download_realm_archive "$latest_version" "realm.tar.gz"; then
         echo -e "${COLOR_RED}下载失败，升级中止${COLOR_RESET}"
         # 恢复配置文件
         mv config.toml.backup config.toml
@@ -1566,6 +1651,33 @@ handle_cli_args() {
 
 handle_cli_args "$@"
 
+handle_maintenance_menu() {
+    while true; do
+        show_maintenance_menu
+        read -r -p "请选择一个选项: " maintenance_choice
+        case $maintenance_choice in
+            1) deploy_realm ;;
+            2) upgrade_realm ;;
+            3) uninstall_realm ;;
+            4) install_manager ;;
+            5)
+                uninstall_manager
+                exit 0
+                ;;
+            6)
+                if [ -e "$COMMAND_PATH" ] || [ -L "$COMMAND_PATH" ]; then
+                    remove_shortcut
+                else
+                    create_shortcut_internal
+                fi
+                ;;
+            0) break ;;
+            *) echo "无效选项: $maintenance_choice" ;;
+        esac
+        wait_key
+    done
+}
+
 # 在主循环之前添加
 # 检查是否在终端中运行
 if [ ! -t 0 ]; then
@@ -1583,6 +1695,27 @@ while true; do
     check_realm_status
     show_main_menu
     read -r -p "请选择一个选项: " choice
+
+    if ! is_realm_installed; then
+        case $choice in
+            1)
+                deploy_realm
+                wait_key
+                ;;
+            2)
+                handle_maintenance_menu
+                ;;
+            0)
+                exit 0
+                ;;
+            *)
+                echo "无效选项: $choice"
+                wait_key
+                ;;
+        esac
+        continue
+    fi
+
     case $choice in
         1)  # 服务管理
             while true; do
@@ -1629,30 +1762,7 @@ while true; do
             done
             ;;
         3)  # 系统维护
-            while true; do
-                show_maintenance_menu
-                read -r -p "请选择一个选项: " maintenance_choice
-                case $maintenance_choice in
-                    1) deploy_realm ;;
-                    2) upgrade_realm ;;
-                    3) uninstall_realm ;;
-                    4) install_manager ;;
-                    5)
-                        uninstall_manager
-                        exit 0
-                        ;;
-                    6)
-                        if [ -e "$COMMAND_PATH" ] || [ -L "$COMMAND_PATH" ]; then
-                            remove_shortcut
-                        else
-                            create_shortcut_internal
-                        fi
-                        ;;
-                    0) break ;;
-                    *) echo "无效选项: $maintenance_choice" ;;
-                esac
-                wait_key
-            done
+            handle_maintenance_menu
             ;;
         0)
             exit 0

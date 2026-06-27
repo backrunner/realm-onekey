@@ -122,10 +122,12 @@ install_dependencies() {
     fi
 }
 
-echo -e "\033%G"  # 设置终端字符集
+if [ -t 1 ]; then
+    printf '\033%%G'  # 设置终端字符集
+fi
 
 # 定义脚本版本
-SCRIPT_VERSION="20250328"
+SCRIPT_VERSION="20260628"
 
 # 定义 realm 版本变量
 REALM_VERSION="v2.7.0"  # 预设版本
@@ -133,8 +135,13 @@ LATEST_VERSION=""       # 用于存储从 GitHub 获取的最新版本
 GITHUB_TIMEOUT=5       # GitHub API 请求超时时间（秒）
 
 # 定义基础目录（在脚本最前面添加）
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 REALM_DIR="${SCRIPT_DIR}/realm"
+INSTALL_DIR="/usr/local/realm-onekey"
+INSTALL_SCRIPT="${INSTALL_DIR}/realm-onekey.sh"
+COMMAND_NAME="realm-manager"
+COMMAND_PATH="/usr/local/bin/${COMMAND_NAME}"
 
 # 初始化状态变量
 realm_status="未知"
@@ -145,19 +152,63 @@ wait_key() {
     read -r -p "按回车键继续..."
 }
 
+run_as_root() {
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+ensure_root_capability() {
+    if [ "${EUID:-$(id -u)}" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo -e "${COLOR_RED}需要 root 权限或 sudo 才能继续${COLOR_RESET}"
+    return 1
+}
+
+resolve_path() {
+    local path="$1"
+
+    if command -v readlink >/dev/null 2>&1; then
+        readlink -f "$path" 2>/dev/null && return 0
+    fi
+
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$path" 2>/dev/null && return 0
+    fi
+
+    echo "$path"
+}
+
+confirm_yes_no() {
+    local prompt="$1"
+    local default_answer="$2"
+    local answer=""
+    local suffix="(y/N)"
+
+    if [[ "$default_answer" == [Yy] ]]; then
+        suffix="(Y/n)"
+    fi
+
+    read -r -p "${prompt} ${suffix}: " answer
+    answer="${answer:-$default_answer}"
+    [[ "$answer" == [Yy] ]]
+}
+
 # 检查是否已经创建了快捷方式
 check_and_create_shortcut() {
-    local shortcut_name="realm-manager"
-    local shortcut_path="/usr/local/bin/${shortcut_name}"
     local flag_file="${SCRIPT_DIR}/.no_shortcut"
 
     # 如果存在标记文件或已经创建了快捷方式，则不询问
-    if [ -f "$flag_file" ] || [ -f "$shortcut_path" ]; then
+    if [ -f "$flag_file" ] || [ -e "$COMMAND_PATH" ] || [ -L "$COMMAND_PATH" ]; then
         return
     fi
 
     echo -e "${COLOR_YELLOW}检测到未创建快捷方式。${COLOR_RESET}"
-    read -r -p "是否创建 'realm-manager' 命令快捷方式？(y/N): " create_shortcut
+    read -r -p "是否创建 '${COMMAND_NAME}' 命令快捷方式？(y/N): " create_shortcut
     if [[ $create_shortcut == [Yy] ]]; then
         create_shortcut_internal
     else
@@ -170,13 +221,21 @@ check_and_create_shortcut() {
 
 # 添加创建快捷方式的内部函数
 create_shortcut_internal() {
-    local shortcut_name="realm-manager"
-    local shortcut_path="/usr/local/bin/${shortcut_name}"
-    local script_path=$(readlink -f "$0")
+    local script_path
 
-    if sudo ln -sf "$script_path" "$shortcut_path"; then
-        sudo chmod +x "$shortcut_path"
-        echo -e "${COLOR_GREEN}快捷方式已创建！现在可以使用 'realm-manager' 命令来启动管理脚本。${COLOR_RESET}"
+    if [ -f "$INSTALL_SCRIPT" ]; then
+        script_path="$INSTALL_SCRIPT"
+    else
+        script_path=$(resolve_path "$SCRIPT_PATH")
+    fi
+
+    if ! ensure_root_capability; then
+        return 1
+    fi
+
+    if run_as_root ln -sf "$script_path" "$COMMAND_PATH"; then
+        run_as_root chmod +x "$COMMAND_PATH"
+        echo -e "${COLOR_GREEN}快捷方式已创建！现在可以使用 '${COMMAND_NAME}' 命令来启动管理脚本。${COLOR_RESET}"
         # 如果存在不创建快捷方式的标记文件，删除它
         rm -f "${SCRIPT_DIR}/.no_shortcut"
     else
@@ -186,11 +245,12 @@ create_shortcut_internal() {
 
 # 添加删除快捷方式的函数
 remove_shortcut() {
-    local shortcut_name="realm-manager"
-    local shortcut_path="/usr/local/bin/${shortcut_name}"
+    if [ -e "$COMMAND_PATH" ] || [ -L "$COMMAND_PATH" ]; then
+        if ! ensure_root_capability; then
+            return 1
+        fi
 
-    if [ -f "$shortcut_path" ]; then
-        if sudo rm -f "$shortcut_path"; then
+        if run_as_root rm -f "$COMMAND_PATH"; then
             echo -e "${COLOR_GREEN}快捷方式已删除${COLOR_RESET}"
             # 创建标记文件表示用户主动删除了快捷方式
             touch "${SCRIPT_DIR}/.no_shortcut"
@@ -201,6 +261,95 @@ remove_shortcut() {
         echo -e "${COLOR_YELLOW}快捷方式不存在${COLOR_RESET}"
     fi
     sleep 1
+}
+
+install_manager() {
+    local source_path
+    local source_dir
+    local install_dir_resolved
+
+    if ! ensure_root_capability; then
+        return 1
+    fi
+
+    source_path=$(resolve_path "$SCRIPT_PATH")
+    source_dir=$(resolve_path "$SCRIPT_DIR")
+    install_dir_resolved=$(resolve_path "$INSTALL_DIR")
+
+    echo -e "${COLOR_BLUE}正在安装 realm 管理脚本...${COLOR_RESET}"
+    if ! run_as_root mkdir -p "$INSTALL_DIR"; then
+        echo -e "${COLOR_RED}创建安装目录失败：${INSTALL_DIR}${COLOR_RESET}"
+        return 1
+    fi
+
+    if [ "$source_path" != "$(resolve_path "$INSTALL_SCRIPT")" ]; then
+        if ! run_as_root cp "$source_path" "$INSTALL_SCRIPT"; then
+            echo -e "${COLOR_RED}复制脚本失败${COLOR_RESET}"
+            return 1
+        fi
+    fi
+
+    if ! run_as_root chmod 755 "$INSTALL_SCRIPT"; then
+        echo -e "${COLOR_RED}设置脚本权限失败${COLOR_RESET}"
+        return 1
+    fi
+
+    if ! run_as_root ln -sf "$INSTALL_SCRIPT" "$COMMAND_PATH"; then
+        echo -e "${COLOR_RED}创建命令入口失败：${COMMAND_PATH}${COLOR_RESET}"
+        return 1
+    fi
+
+    if [ "$source_dir" != "$install_dir_resolved" ] && [ -d "${SCRIPT_DIR}/realm" ] && [ ! -e "${INSTALL_DIR}/realm" ]; then
+        if confirm_yes_no "检测到当前目录已有 realm 数据，是否复制到安装目录" "y"; then
+            if run_as_root cp -a "${SCRIPT_DIR}/realm" "${INSTALL_DIR}/realm"; then
+                echo -e "${COLOR_GREEN}realm 数据已复制到 ${INSTALL_DIR}/realm${COLOR_RESET}"
+            else
+                echo -e "${COLOR_YELLOW}realm 数据复制失败，请按需手动迁移${COLOR_RESET}"
+            fi
+        fi
+    fi
+
+    rm -f "${SCRIPT_DIR}/.no_shortcut"
+    echo -e "${COLOR_GREEN}安装完成！现在可以使用 '${COMMAND_NAME}' 启动管理脚本。${COLOR_RESET}"
+    if [ "$source_dir" != "$install_dir_resolved" ]; then
+        echo -e "${COLOR_YELLOW}当前会话仍使用 ${SCRIPT_DIR}，退出后运行 '${COMMAND_NAME}' 将使用安装目录。${COLOR_RESET}"
+    fi
+}
+
+uninstall_manager() {
+    local purge="$1"
+    local purge_realm_dir="${INSTALL_DIR}/realm"
+
+    if ! ensure_root_capability; then
+        return 1
+    fi
+
+    if [ "$purge" != "purge" ] && confirm_yes_no "是否同时卸载 realm 服务和数据" "n"; then
+        purge="purge"
+    fi
+
+    if [ "$purge" = "purge" ]; then
+        if [ ! -d "$purge_realm_dir" ] && [ -d "$REALM_DIR" ]; then
+            purge_realm_dir="$REALM_DIR"
+        fi
+        uninstall_realm_from_dir "$purge_realm_dir"
+    fi
+
+    if [ -e "$COMMAND_PATH" ] || [ -L "$COMMAND_PATH" ]; then
+        run_as_root rm -f "$COMMAND_PATH"
+    fi
+
+    if [ -f "$INSTALL_SCRIPT" ]; then
+        run_as_root rm -f "$INSTALL_SCRIPT"
+    fi
+
+    if [ "$purge" = "purge" ]; then
+        run_as_root rm -rf "$INSTALL_DIR"
+    else
+        run_as_root rmdir "$INSTALL_DIR" >/dev/null 2>&1 || true
+    fi
+
+    echo -e "${COLOR_GREEN}管理脚本已卸载${COLOR_RESET}"
 }
 
 # 获取本地 realm 版本
@@ -318,13 +467,15 @@ show_maintenance_menu() {
     clear
     echo "realm 系统维护"
     echo "================="
-    echo "1. 部署 realm"
+    echo "1. 安装/部署 realm"
     echo "2. 升级 realm"
     echo "3. 卸载 realm"
-    if [ -f "/usr/local/bin/realm-manager" ]; then
-        echo "4. 删除快捷方式"
+    echo "4. 安装/更新管理脚本"
+    echo "5. 卸载管理脚本"
+    if [ -e "$COMMAND_PATH" ] || [ -L "$COMMAND_PATH" ]; then
+        echo "6. 删除快捷方式"
     else
-        echo "4. 创建快捷方式"
+        echo "6. 创建快捷方式"
     fi
     echo "0. 返回主菜单"
     echo "================="
@@ -576,13 +727,35 @@ EOF
 }
 
 # 卸载realm
-uninstall_realm() {
-    systemctl stop realm
-    systemctl disable realm
-    rm -f /etc/systemd/system/realm.service
-    systemctl daemon-reload
-    rm -rf "${REALM_DIR}"
+uninstall_realm_from_dir() {
+    local target_realm_dir="$1"
+
+    if [ -z "$target_realm_dir" ] || [ "$target_realm_dir" = "/" ]; then
+        echo -e "${COLOR_RED}卸载目录异常，已取消操作${COLOR_RESET}"
+        return 1
+    fi
+
+    if ! ensure_root_capability; then
+        return 1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        run_as_root systemctl stop realm >/dev/null 2>&1 || true
+        run_as_root systemctl disable realm >/dev/null 2>&1 || true
+    fi
+
+    run_as_root rm -f /etc/systemd/system/realm.service
+
+    if command -v systemctl >/dev/null 2>&1; then
+        run_as_root systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    run_as_root rm -rf "$target_realm_dir"
     echo "realm 已被卸载。"
+}
+
+uninstall_realm() {
+    uninstall_realm_from_dir "${REALM_DIR}"
     # 更新realm状态变量
     realm_status="未安装"
     realm_status_color="\033[0;31m" # 红色
@@ -1347,6 +1520,52 @@ list_forwards() {
     echo -e "\n==================="
 }
 
+show_usage() {
+    cat << EOF
+用法:
+  ./realm-onekey.sh                 启动交互式管理菜单
+  ./realm-onekey.sh install         安装/更新管理脚本到 ${INSTALL_SCRIPT}
+  ./realm-onekey.sh uninstall       卸载管理脚本和 ${COMMAND_NAME} 命令
+  ./realm-onekey.sh uninstall --purge
+                                   同时卸载 realm 服务和数据
+  ./realm-onekey.sh help            显示帮助
+
+安装后可直接运行:
+  ${COMMAND_NAME}
+EOF
+}
+
+handle_cli_args() {
+    case "$1" in
+        "" )
+            return 0
+            ;;
+        install|--install)
+            install_manager
+            exit $?
+            ;;
+        uninstall|--uninstall)
+            if [ "$2" = "--purge" ] || [ "$2" = "purge" ]; then
+                uninstall_manager "purge"
+            else
+                uninstall_manager
+            fi
+            exit $?
+            ;;
+        help|--help|-h)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo -e "${COLOR_RED}未知参数：$1${COLOR_RESET}"
+            show_usage
+            exit 1
+            ;;
+    esac
+}
+
+handle_cli_args "$@"
+
 # 在主循环之前添加
 # 检查是否在终端中运行
 if [ ! -t 0 ]; then
@@ -1357,6 +1576,7 @@ fi
 # 在脚本开始处（主循环之前）添加发行版检测
 detect_distro
 init_latest_version  # 初始化时获取最新版本
+check_and_create_shortcut
 
 # 主循环
 while true; do
@@ -1416,8 +1636,13 @@ while true; do
                     1) deploy_realm ;;
                     2) upgrade_realm ;;
                     3) uninstall_realm ;;
-                    4)
-                        if [ -f "/usr/local/bin/realm-manager" ]; then
+                    4) install_manager ;;
+                    5)
+                        uninstall_manager
+                        exit 0
+                        ;;
+                    6)
+                        if [ -e "$COMMAND_PATH" ] || [ -L "$COMMAND_PATH" ]; then
                             remove_shortcut
                         else
                             create_shortcut_internal
@@ -1438,7 +1663,3 @@ while true; do
             ;;
     esac
 done
-
-# 在主循环之前调用这个函数
-# 在脚本开始处（主循环之前）添加：
-check_and_create_shortcut

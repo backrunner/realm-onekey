@@ -1504,18 +1504,22 @@ modify_forward() {
             cp "${REALM_DIR}/config.toml" "${REALM_DIR}/config.toml.bak"
 
             if [[ $new_listen_mode == "1" ]]; then
-                # 询问是否保留当前IP还是设置新IP
-                local new_listen_ip="$current_listen_ip"
-                local new_listen_family="$current_listen_family"
+                # 使用 IP 监听时先选择地址族，再选择或保留同族监听 IP。
+                select_address_family "监听"
+                local new_listen_family="$SELECTED_FAMILY"
+                local new_listen_ip=""
                 local new_listen_addr=""
 
-                read -r -p "是否保留当前监听IP? (Y/n): " keep_current_ip
-
-                if [[ -z "$keep_current_ip" || $keep_current_ip == [Yy] ]]; then
-                    echo "保留当前监听IP：$current_listen_ip"
+                if [ "$new_listen_family" = "$current_listen_family" ]; then
+                    read -r -p "是否保留当前监听IP? ($(format_ip_for_config "$current_listen_ip")) (Y/n): " keep_current_ip
+                    if [[ -z "$keep_current_ip" || $keep_current_ip == [Yy] ]]; then
+                        new_listen_ip="$current_listen_ip"
+                        echo "保留当前监听IP：$(format_ip_for_config "$current_listen_ip")"
+                    else
+                        choose_listen_ip "$new_listen_family"
+                        new_listen_ip="$SELECTED_LISTEN_IP"
+                    fi
                 else
-                    select_address_family "监听"
-                    new_listen_family="$SELECTED_FAMILY"
                     choose_listen_ip "$new_listen_family"
                     new_listen_ip="$SELECTED_LISTEN_IP"
                 fi

@@ -123,7 +123,7 @@ install_dependencies() {
 }
 
 # 定义脚本版本
-SCRIPT_VERSION="20260628"
+SCRIPT_VERSION="20260708"
 
 # 定义 realm 版本变量
 REALM_VERSION="v2.7.0"  # 预设版本
@@ -147,6 +147,13 @@ INSTALL_DIR="/usr/local/realm-onekey"
 INSTALL_SCRIPT="${INSTALL_DIR}/realm-onekey.sh"
 COMMAND_NAME="realm-manager"
 COMMAND_PATH="/usr/local/bin/${COMMAND_NAME}"
+REALM_SERVICE_UNIT="realm.service"
+REALM_SERVICE_PATH="/etc/systemd/system/${REALM_SERVICE_UNIT}"
+REALM_HEALTHCHECK_NAME="realm-healthcheck"
+REALM_HEALTHCHECK_SCRIPT="/usr/local/bin/${REALM_HEALTHCHECK_NAME}"
+REALM_HEALTHCHECK_SERVICE="/etc/systemd/system/${REALM_HEALTHCHECK_NAME}.service"
+REALM_HEALTHCHECK_TIMER="/etc/systemd/system/${REALM_HEALTHCHECK_NAME}.timer"
+REALM_HEALTHCHECK_INTERVAL="${REALM_HEALTHCHECK_INTERVAL:-1min}"
 
 # 初始化状态变量
 realm_status="未知"
@@ -201,6 +208,476 @@ confirm_yes_no() {
     read -r -p "${prompt} ${suffix}: " answer
     answer="${answer:-$default_answer}"
     [[ "$answer" == [Yy] ]]
+}
+
+write_root_file() {
+    local target="$1"
+    local mode="${2:-644}"
+    local tmp_file
+
+    tmp_file=$(mktemp) || {
+        echo -e "${COLOR_RED}创建临时文件失败${COLOR_RESET}"
+        return 1
+    }
+
+    if ! cat > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo -e "${COLOR_RED}写入临时文件失败${COLOR_RESET}"
+        return 1
+    fi
+
+    if run_as_root install -D -m "$mode" "$tmp_file" "$target"; then
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    rm -f "$tmp_file"
+    echo -e "${COLOR_RED}写入文件失败：${target}${COLOR_RESET}"
+    return 1
+}
+
+sed_escape_replacement() {
+    printf '%s' "$1" | sed -e 's/[\/&|]/\\&/g'
+}
+
+generate_realm_service_unit() {
+    cat << EOF
+[Unit]
+Description=realm
+After=network-online.target
+Wants=network-online.target systemd-networkd-wait-online.service
+StartLimitIntervalSec=60
+StartLimitBurst=12
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=5s
+WorkingDirectory=${REALM_DIR}
+ExecStart=${REALM_DIR}/realm -c ${REALM_DIR}/config.toml
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+upgrade_realm_service_config() {
+    local apply_now="${1:-no}"
+    local quiet="${2:-no}"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        [ "$quiet" = "yes" ] || echo -e "${COLOR_YELLOW}未检测到 systemctl，跳过 realm 服务配置升级${COLOR_RESET}"
+        return 1
+    fi
+
+    if ! ensure_root_capability; then
+        return 1
+    fi
+
+    if [ ! -f "${REALM_DIR}/realm" ]; then
+        [ "$quiet" = "yes" ] || echo -e "${COLOR_RED}错误: realm 可执行文件不存在，无法升级服务配置${COLOR_RESET}"
+        return 1
+    fi
+
+    if [ ! -f "${REALM_DIR}/config.toml" ]; then
+        [ "$quiet" = "yes" ] || echo -e "${COLOR_RED}错误: realm 配置文件不存在，无法升级服务配置${COLOR_RESET}"
+        return 1
+    fi
+
+    if ! generate_realm_service_unit | write_root_file "$REALM_SERVICE_PATH" 644; then
+        return 1
+    fi
+
+    if ! run_as_root systemctl daemon-reload >/dev/null 2>&1; then
+        echo -e "${COLOR_RED}systemd 配置重载失败${COLOR_RESET}"
+        return 1
+    fi
+
+    [ "$quiet" = "yes" ] || echo -e "${COLOR_GREEN}realm systemd 服务配置已升级${COLOR_RESET}"
+
+    if [ "$apply_now" = "apply-now" ] && systemctl is-active --quiet "$REALM_SERVICE_UNIT"; then
+        if run_as_root systemctl restart "$REALM_SERVICE_UNIT"; then
+            [ "$quiet" = "yes" ] || echo -e "${COLOR_GREEN}realm 服务已重启并应用新配置${COLOR_RESET}"
+        else
+            echo -e "${COLOR_RED}realm 服务配置已写入，但重启失败，请手动检查服务状态${COLOR_RESET}"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+generate_realm_healthcheck_script() {
+    local realm_dir_escaped
+    local service_unit_escaped
+    local healthcheck_name_escaped
+
+    realm_dir_escaped=$(sed_escape_replacement "$REALM_DIR")
+    service_unit_escaped=$(sed_escape_replacement "$REALM_SERVICE_UNIT")
+    healthcheck_name_escaped=$(sed_escape_replacement "$REALM_HEALTHCHECK_NAME")
+
+    cat <<'HEALTHCHECK_SCRIPT' | sed \
+        -e "s|__REALM_DIR__|$realm_dir_escaped|g" \
+        -e "s|__REALM_SERVICE_UNIT__|$service_unit_escaped|g" \
+        -e "s|__REALM_HEALTHCHECK_NAME__|$healthcheck_name_escaped|g"
+#!/bin/bash
+set -u
+
+REALM_SERVICE_UNIT="__REALM_SERVICE_UNIT__"
+CONFIG_PATH="__REALM_DIR__/config.toml"
+LOG_TAG="__REALM_HEALTHCHECK_NAME__"
+RESTART_COOLDOWN=90
+
+log() {
+    local message="$*"
+
+    if command -v logger >/dev/null 2>&1; then
+        logger -t "$LOG_TAG" "$message"
+    fi
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $message"
+}
+
+restart_realm() {
+    local reason="$1"
+    local state_dir="/run/${LOG_TAG}"
+    local stamp_file="${state_dir}/last-restart"
+    local now
+    local last_restart=0
+
+    now=$(date +%s)
+    mkdir -p "$state_dir" 2>/dev/null || true
+
+    if [ -f "$stamp_file" ]; then
+        last_restart=$(cat "$stamp_file" 2>/dev/null || echo 0)
+    fi
+
+    if [[ "$last_restart" =~ ^[0-9]+$ ]] && [ "$last_restart" -gt 0 ] && [ $((now - last_restart)) -lt "$RESTART_COOLDOWN" ]; then
+        log "跳过重启：${reason}；距离上次自动重启不足 ${RESTART_COOLDOWN}s"
+        return 0
+    fi
+
+    echo "$now" > "$stamp_file" 2>/dev/null || true
+    log "检测异常：${reason}；正在重启 ${REALM_SERVICE_UNIT}"
+
+    if ! systemctl restart "$REALM_SERVICE_UNIT"; then
+        log "重启 ${REALM_SERVICE_UNIT} 失败"
+        return 1
+    fi
+
+    sleep 2
+    if systemctl is-active --quiet "$REALM_SERVICE_UNIT"; then
+        log "${REALM_SERVICE_UNIT} 已恢复 active"
+        return 0
+    fi
+
+    log "重启命令已执行，但 ${REALM_SERVICE_UNIT} 仍未 active"
+    return 1
+}
+
+config_bool_is_true() {
+    local key="$1"
+    local value=""
+
+    [ -f "$CONFIG_PATH" ] || return 1
+    value=$(awk -v key="$key" '
+        /^\[network\]/ { in_network = 1; next }
+        /^\[/ { in_network = 0 }
+        in_network {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            if (line ~ "^[[:space:]]*" key "[[:space:]]*=") {
+                sub(/^[^=]*=/, "", line)
+                gsub(/[[:space:]\"]/, "", line)
+                print line
+                exit
+            }
+        }
+    ' "$CONFIG_PATH" | tr '[:upper:]' '[:lower:]')
+
+    [ "$value" = "true" ]
+}
+
+get_listen_ports() {
+    [ -f "$CONFIG_PATH" ] || return 1
+
+    awk -F'"' '/^[[:space:]]*listen[[:space:]]*=/ { print $2 }' "$CONFIG_PATH" |
+        while IFS= read -r listen_addr; do
+            local port=""
+
+            if [[ "$listen_addr" =~ ^\[.*\]:([0-9]+)$ ]]; then
+                port="${BASH_REMATCH[1]}"
+            elif [[ "$listen_addr" =~ :([0-9]+)$ ]]; then
+                port="${BASH_REMATCH[1]}"
+            fi
+
+            if [[ "$port" =~ ^[0-9]+$ ]]; then
+                echo "$port"
+            fi
+        done | sort -u
+}
+
+port_is_bound_by_pid() {
+    local proto="$1"
+    local port="$2"
+    local pid="$3"
+    local output=""
+
+    if [ "$proto" = "udp" ]; then
+        output=$(ss -H -lunp 2>/dev/null || ss -H -lun 2>/dev/null)
+    else
+        output=$(ss -H -ltnp 2>/dev/null || ss -H -ltn 2>/dev/null)
+    fi
+
+    [ -n "$output" ] || return 1
+
+    if printf '%s\n' "$output" | grep -q 'pid=' && [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 0 ]; then
+        printf '%s\n' "$output" | awk -v port="$port" -v pid="$pid" '
+            function has_port() {
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ (":" port "$") || $i ~ ("]:" port "$")) {
+                        return 1
+                    }
+                }
+                return 0
+            }
+            has_port() && $0 ~ ("pid=" pid "[,)]") { found = 1 }
+            END { exit found ? 0 : 1 }
+        '
+        return $?
+    fi
+
+    printf '%s\n' "$output" | awk -v port="$port" '
+        function has_port() {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ (":" port "$") || $i ~ ("]:" port "$")) {
+                    return 1
+                }
+            }
+            return 0
+        }
+        has_port() { found = 1 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+check_listen_ports() {
+    local pid="$1"
+    local proto="tcp"
+    local ports=()
+    local missing_ports=()
+    local port
+
+    if ! command -v ss >/dev/null 2>&1; then
+        log "未找到 ss 命令，跳过监听端口检查"
+        return 0
+    fi
+
+    if [ ! -f "$CONFIG_PATH" ]; then
+        log "配置文件不存在，跳过监听端口检查：${CONFIG_PATH}"
+        return 0
+    fi
+
+    if config_bool_is_true "no_tcp"; then
+        proto="udp"
+    fi
+
+    mapfile -t ports < <(get_listen_ports)
+    if [ "${#ports[@]}" -eq 0 ]; then
+        log "未配置转发规则，跳过监听端口检查"
+        return 0
+    fi
+
+    for port in "${ports[@]}"; do
+        [ -n "$port" ] || continue
+
+        if ! port_is_bound_by_pid "$proto" "$port" "$pid"; then
+            missing_ports+=("${proto}/${port}")
+        fi
+    done
+
+    if [ "${#missing_ports[@]}" -gt 0 ]; then
+        restart_realm "监听端口未就绪：${missing_ports[*]}"
+        return $?
+    fi
+
+    log "健康检查通过：${REALM_SERVICE_UNIT} active，监听端口正常"
+    return 0
+}
+
+main() {
+    local main_pid
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log "未找到 systemctl，无法执行健康检查"
+        return 0
+    fi
+
+    if ! systemctl is-active --quiet "$REALM_SERVICE_UNIT"; then
+        restart_realm "服务未运行"
+        return $?
+    fi
+
+    main_pid=$(systemctl show -p MainPID --value "$REALM_SERVICE_UNIT" 2>/dev/null || echo 0)
+    if ! [[ "$main_pid" =~ ^[0-9]+$ ]] || [ "$main_pid" -le 0 ]; then
+        restart_realm "无法获取主进程 PID"
+        return $?
+    fi
+
+    check_listen_ports "$main_pid"
+}
+
+main "$@"
+HEALTHCHECK_SCRIPT
+}
+
+install_realm_healthcheck_timer() {
+    local mode="${1:-enable-now}"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "${COLOR_YELLOW}未检测到 systemctl，跳过自动拉活任务配置${COLOR_RESET}"
+        return 1
+    fi
+
+    if ! ensure_root_capability; then
+        return 1
+    fi
+
+    if ! upgrade_realm_service_config "no" "yes"; then
+        echo -e "${COLOR_RED}realm 服务配置升级失败，自动拉活任务未启用${COLOR_RESET}"
+        return 1
+    fi
+
+    if ! generate_realm_healthcheck_script | write_root_file "$REALM_HEALTHCHECK_SCRIPT" 755; then
+        return 1
+    fi
+
+    if ! write_root_file "$REALM_HEALTHCHECK_SERVICE" 644 << EOF
+[Unit]
+Description=realm health check and auto revive
+After=network-online.target ${REALM_SERVICE_UNIT}
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${REALM_HEALTHCHECK_SCRIPT}
+EOF
+    then
+        return 1
+    fi
+
+    if ! write_root_file "$REALM_HEALTHCHECK_TIMER" 644 << EOF
+[Unit]
+Description=Run realm health check periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${REALM_HEALTHCHECK_INTERVAL}
+AccuracySec=15s
+Persistent=true
+Unit=${REALM_HEALTHCHECK_NAME}.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    then
+        return 1
+    fi
+
+    run_as_root systemctl daemon-reload >/dev/null 2>&1 || {
+        echo -e "${COLOR_RED}systemd 配置重载失败${COLOR_RESET}"
+        return 1
+    }
+
+    case "$mode" in
+        enable-now)
+            if run_as_root systemctl enable --now "${REALM_HEALTHCHECK_NAME}.timer" >/dev/null 2>&1; then
+                echo -e "${COLOR_GREEN}自动拉活任务已启用（每 ${REALM_HEALTHCHECK_INTERVAL} 检查一次）${COLOR_RESET}"
+                return 0
+            fi
+            echo -e "${COLOR_RED}自动拉活任务启用失败${COLOR_RESET}"
+            return 1
+            ;;
+        enable)
+            if run_as_root systemctl enable "${REALM_HEALTHCHECK_NAME}.timer" >/dev/null 2>&1; then
+                echo -e "${COLOR_GREEN}自动拉活任务已设置为开机启用${COLOR_RESET}"
+                return 0
+            fi
+            echo -e "${COLOR_RED}自动拉活任务设置开机启用失败${COLOR_RESET}"
+            return 1
+            ;;
+        install-only)
+            echo -e "${COLOR_GREEN}自动拉活任务文件已安装，启动 realm 服务时会自动启用${COLOR_RESET}"
+            return 0
+            ;;
+        *)
+            echo -e "${COLOR_RED}未知的自动拉活任务模式：${mode}${COLOR_RESET}"
+            return 1
+            ;;
+    esac
+}
+
+disable_realm_healthcheck_timer() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! ensure_root_capability; then
+        return 1
+    fi
+
+    run_as_root systemctl disable --now "${REALM_HEALTHCHECK_NAME}.timer" >/dev/null 2>&1 || true
+    echo -e "${COLOR_GREEN}自动拉活任务已停用${COLOR_RESET}"
+}
+
+uninstall_realm_healthcheck_timer() {
+    if ! ensure_root_capability; then
+        return 1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        run_as_root systemctl disable --now "${REALM_HEALTHCHECK_NAME}.timer" >/dev/null 2>&1 || true
+    fi
+
+    run_as_root rm -f "$REALM_HEALTHCHECK_SCRIPT" "$REALM_HEALTHCHECK_SERVICE" "$REALM_HEALTHCHECK_TIMER"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        run_as_root systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+check_realm_healthcheck_status() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "${COLOR_YELLOW}不可用${COLOR_RESET}"
+        return
+    fi
+
+    if systemctl is-active --quiet "${REALM_HEALTHCHECK_NAME}.timer"; then
+        echo -e "${COLOR_GREEN}已启用${COLOR_RESET}"
+    elif [ -f "$REALM_HEALTHCHECK_TIMER" ]; then
+        echo -e "${COLOR_YELLOW}未启用${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}未安装${COLOR_RESET}"
+    fi
+}
+
+show_realm_healthcheck_status() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "${COLOR_YELLOW}当前系统未检测到 systemctl，无法查看自动拉活任务状态${COLOR_RESET}"
+        return 0
+    fi
+
+    echo "自动拉活任务状态："
+    echo "==================="
+    systemctl status "${REALM_HEALTHCHECK_NAME}.timer" --no-pager 2>/dev/null || true
+    echo
+    echo "最近一次健康检查："
+    systemctl status "${REALM_HEALTHCHECK_NAME}.service" --no-pager 2>/dev/null || true
+    echo
+    echo "最近日志："
+    journalctl -u "${REALM_HEALTHCHECK_NAME}.service" -n 20 --no-pager 2>/dev/null || true
 }
 
 # 检查是否已经创建了快捷方式
@@ -396,7 +873,7 @@ check_realm_status() {
 
 # 检查realm服务状态
 check_realm_service_status() {
-    if systemctl is-active --quiet realm; then
+    if systemctl is-active --quiet "$REALM_SERVICE_UNIT"; then
         echo -e "\033[0;32m启用\033[0m" # 绿色
     else
         echo -e "\033[0;31m未启用\033[0m" # 红色
@@ -522,6 +999,8 @@ show_main_menu() {
     echo -e "realm 最新版本：$(get_latest_version || echo "$REALM_VERSION")"
     echo -n "realm 转发状态："
     check_realm_service_status
+    echo -n "自动拉活任务："
+    check_realm_healthcheck_status
 }
 
 # 修改菜单显示函数，移除内部的输入处理
@@ -533,6 +1012,10 @@ show_service_menu() {
     echo "2. 停止服务"
     echo "3. 重启服务"
     echo "4. 查看配置文件"
+    echo "5. 查看自动拉活状态"
+    echo "6. 启用自动拉活"
+    echo "7. 停用自动拉活"
+    echo "8. 升级 systemd 服务配置"
     echo "0. 返回主菜单"
     echo "================="
 }
@@ -1128,8 +1611,6 @@ deploy_realm() {
         sed -i '/# DNS 配置将在此处添加/c\# 使用系统默认 DNS' "${REALM_DIR}/config.toml"
     fi
 
-    # 创建 systemd 服务文件
-    local service_path="/etc/systemd/system/realm.service"
     if [ "$DISTRO_TYPE" = "rhel" ]; then
         # RHEL 系统需要特殊处理 SELinux
         if command -v sestatus >/dev/null 2>&1 && sestatus | grep -q "enabled"; then
@@ -1140,28 +1621,11 @@ deploy_realm() {
         fi
     fi
 
-    # 创建服务文件
-    cat > "$service_path" << EOF
-[Unit]
-Description=realm
-After=network-online.target
-Wants=network-online.target systemd-networkd-wait-online.service
+    if ! upgrade_realm_service_config "no"; then
+        return 1
+    fi
 
-[Service]
-Type=simple
-User=root
-Restart=on-failure
-RestartSec=5s
-DynamicUser=true
-WorkingDirectory=${REALM_DIR}
-ExecStart=${REALM_DIR}/realm -c ${REALM_DIR}/config.toml
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
+    install_realm_healthcheck_timer "install-only" || true
 
     # 更新 realm 状态变量
     realm_status="已安装"
@@ -1182,12 +1646,14 @@ uninstall_realm_from_dir() {
         return 1
     fi
 
+    uninstall_realm_healthcheck_timer || true
+
     if command -v systemctl >/dev/null 2>&1; then
-        run_as_root systemctl stop realm >/dev/null 2>&1 || true
-        run_as_root systemctl disable realm >/dev/null 2>&1 || true
+        run_as_root systemctl stop "$REALM_SERVICE_UNIT" >/dev/null 2>&1 || true
+        run_as_root systemctl disable "$REALM_SERVICE_UNIT" >/dev/null 2>&1 || true
     fi
 
-    run_as_root rm -f /etc/systemd/system/realm.service
+    run_as_root rm -f "$REALM_SERVICE_PATH"
 
     if command -v systemctl >/dev/null 2>&1; then
         run_as_root systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1268,11 +1734,13 @@ delete_forward() {
 
     # 添加自动重启服务的逻辑
     echo -e "${COLOR_BLUE}正在重启 realm 服务以应用新配置...${COLOR_RESET}"
-    if systemctl restart realm; then
+    upgrade_realm_service_config "no" "yes" || true
+    if run_as_root systemctl restart "$REALM_SERVICE_UNIT"; then
+        install_realm_healthcheck_timer "enable-now" || echo -e "${COLOR_YELLOW}警告: 自动拉活任务启用失败${COLOR_RESET}"
         echo -e "${COLOR_GREEN}服务已重启，新配置已生效${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}服务重启失败，请手动检查服务状态${COLOR_RESET}"
-        systemctl status realm
+        run_as_root systemctl status "$REALM_SERVICE_UNIT"
     fi
 }
 
@@ -1405,11 +1873,13 @@ add_forward() {
 
         # 添加自动重启服务的逻辑
         echo -e "${COLOR_BLUE}正在重启 realm 服务以应用新配置...${COLOR_RESET}"
-        if systemctl restart realm; then
+        upgrade_realm_service_config "no" "yes" || true
+        if run_as_root systemctl restart "$REALM_SERVICE_UNIT"; then
+            install_realm_healthcheck_timer "enable-now" || echo -e "${COLOR_YELLOW}警告: 自动拉活任务启用失败${COLOR_RESET}"
             echo -e "${COLOR_GREEN}服务已重启，新配置已生效${COLOR_RESET}"
         else
             echo -e "${COLOR_RED}服务重启失败，请手动检查服务状态${COLOR_RESET}"
-            systemctl status realm
+            run_as_root systemctl status "$REALM_SERVICE_UNIT"
         fi
 
         read -p "是否继续添加(y/N)? " answer
@@ -1645,23 +2115,18 @@ modify_forward() {
 
     # 自动重启服务
     echo -e "${COLOR_BLUE}正在重启 realm 服务以应用新配置...${COLOR_RESET}"
-    if systemctl restart realm; then
+    upgrade_realm_service_config "no" "yes" || true
+    if run_as_root systemctl restart "$REALM_SERVICE_UNIT"; then
+        install_realm_healthcheck_timer "enable-now" || echo -e "${COLOR_YELLOW}警告: 自动拉活任务启用失败${COLOR_RESET}"
         echo -e "${COLOR_GREEN}服务已重启，新配置已生效${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}服务重启失败，请手动检查服务状态${COLOR_RESET}"
-        systemctl status realm
+        run_as_root systemctl status "$REALM_SERVICE_UNIT"
     fi
 }
 
 # 启动服务
 start_service() {
-    # 检查服务文件是否存在
-    if [ ! -f "/etc/systemd/system/realm.service" ]; then
-        echo -e "${COLOR_RED}错误: realm 服务文件不存在${COLOR_RESET}"
-        wait_key
-        return 1
-    fi
-
     # 检查可执行文件是否存在
     if [ ! -f "${REALM_DIR}/realm" ]; then
         echo -e "${COLOR_RED}错误: realm 可执行文件不存在${COLOR_RESET}"
@@ -1676,38 +2141,41 @@ start_service() {
         return 1
     fi
 
-    # 重新加载 systemd 配置
-    echo -e "${COLOR_BLUE}重新加载 systemd 配置...${COLOR_RESET}"
-    sudo systemctl daemon-reload
+    echo -e "${COLOR_BLUE}升级 realm systemd 服务配置...${COLOR_RESET}"
+    if ! upgrade_realm_service_config "no"; then
+        wait_key
+        return 1
+    fi
 
     # 取消服务屏蔽（如果被屏蔽）
     echo -e "${COLOR_BLUE}取消服务屏蔽...${COLOR_RESET}"
-    sudo systemctl unmask realm.service
+    run_as_root systemctl unmask "$REALM_SERVICE_UNIT"
 
     # 启动服务
     echo -e "${COLOR_BLUE}正在启动 realm 服务...${COLOR_RESET}"
-    if ! sudo systemctl start realm.service; then
+    if ! run_as_root systemctl start "$REALM_SERVICE_UNIT"; then
         echo -e "${COLOR_RED}错误: 启动服务失败${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}查看服务状态...${COLOR_RESET}"
-        sudo systemctl status realm.service
+        run_as_root systemctl status "$REALM_SERVICE_UNIT"
         wait_key
         return 1
     fi
 
     # 设置开机自启
     echo -e "${COLOR_BLUE}设置开机自启...${COLOR_RESET}"
-    if ! sudo systemctl enable realm.service; then
+    if ! run_as_root systemctl enable "$REALM_SERVICE_UNIT"; then
         echo -e "${COLOR_YELLOW}警告: 设置开机自启失败${COLOR_RESET}"
     fi
 
     # 验证服务状态
-    if systemctl is-active --quiet realm; then
+    if systemctl is-active --quiet "$REALM_SERVICE_UNIT"; then
+        install_realm_healthcheck_timer "enable-now" || echo -e "${COLOR_YELLOW}警告: 自动拉活任务启用失败${COLOR_RESET}"
         echo -e "${COLOR_GREEN}realm 服务已成功启动并设置为开机自启${COLOR_RESET}"
         wait_key
         return 0
     else
         echo -e "${COLOR_RED}错误: 服务启动失败，请检查日志${COLOR_RESET}"
-        sudo systemctl status realm.service
+        run_as_root systemctl status "$REALM_SERVICE_UNIT"
         wait_key
         return 1
     fi
@@ -1715,8 +2183,9 @@ start_service() {
 
 # 停止服务
 stop_service() {
+    disable_realm_healthcheck_timer || true
     echo -e "${COLOR_BLUE}正在停止 realm 服务...${COLOR_RESET}"
-    if systemctl stop realm; then
+    if run_as_root systemctl stop "$REALM_SERVICE_UNIT"; then
         echo -e "${COLOR_GREEN}realm 服务已停止${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}停止服务失败${COLOR_RESET}"
@@ -1727,13 +2196,20 @@ stop_service() {
 
 # 重启服务
 restart_service() {
+    echo -e "${COLOR_BLUE}升级 realm systemd 服务配置...${COLOR_RESET}"
+    if ! upgrade_realm_service_config "no"; then
+        wait_key
+        return 1
+    fi
+
     echo -e "${COLOR_BLUE}正在重启 realm 服务...${COLOR_RESET}"
-    if systemctl restart realm; then
+    if run_as_root systemctl restart "$REALM_SERVICE_UNIT"; then
+        install_realm_healthcheck_timer "enable-now" || echo -e "${COLOR_YELLOW}警告: 自动拉活任务启用失败${COLOR_RESET}"
         echo -e "${COLOR_GREEN}realm 服务已重启${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}重启服务失败${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}查看服务状态...${COLOR_RESET}"
-        systemctl status realm
+        run_as_root systemctl status "$REALM_SERVICE_UNIT"
     fi
     wait_key
     return 0
@@ -1766,7 +2242,8 @@ upgrade_realm() {
 
     cd "${REALM_DIR}"
     # 停止服务
-    systemctl stop realm
+    disable_realm_healthcheck_timer || true
+    run_as_root systemctl stop "$REALM_SERVICE_UNIT"
 
     # 备份当前配置文件
     cp config.toml config.toml.backup
@@ -1796,8 +2273,13 @@ upgrade_realm() {
     REALM_VERSION="$latest_version"
 
     echo -e "${COLOR_GREEN}realm 已升级到 $latest_version${COLOR_RESET}"
-    systemctl restart realm
-    echo -e "${COLOR_GREEN}realm 服务已重启${COLOR_RESET}"
+    upgrade_realm_service_config "no" "yes" || true
+    if run_as_root systemctl restart "$REALM_SERVICE_UNIT"; then
+        install_realm_healthcheck_timer "enable-now" || echo -e "${COLOR_YELLOW}警告: 自动拉活任务启用失败${COLOR_RESET}"
+        echo -e "${COLOR_GREEN}realm 服务已重启${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}realm 服务重启失败，请手动检查服务状态${COLOR_RESET}"
+    fi
 }
 
 # 列出所有转发规则
@@ -1904,6 +2386,14 @@ show_usage() {
   ./realm-onekey.sh uninstall       卸载管理脚本和 ${COMMAND_NAME} 命令
   ./realm-onekey.sh uninstall --purge
                                    同时卸载 realm 服务和数据
+  ./realm-onekey.sh service upgrade
+                                   升级已有 realm.service 配置
+  ./realm-onekey.sh healthcheck status
+                                   查看自动拉活任务状态
+  ./realm-onekey.sh healthcheck enable
+                                   安装并启用自动拉活任务
+  ./realm-onekey.sh healthcheck disable
+                                   停用自动拉活任务
   ./realm-onekey.sh help            显示帮助
 
 安装后可直接运行:
@@ -1927,6 +2417,48 @@ handle_cli_args() {
                 uninstall_manager
             fi
             exit $?
+            ;;
+        service|--service)
+            case "$2" in
+                upgrade|update|--upgrade|--update)
+                    upgrade_realm_service_config "apply-now"
+                    exit $?
+                    ;;
+                *)
+                    echo -e "${COLOR_RED}未知 service 参数：$2${COLOR_RESET}"
+                    show_usage
+                    exit 1
+                    ;;
+            esac
+            ;;
+        healthcheck|--healthcheck)
+            case "$2" in
+                enable|install|--enable|--install)
+                    install_realm_healthcheck_timer "enable-now"
+                    exit $?
+                    ;;
+                disable|stop|--disable|--stop)
+                    disable_realm_healthcheck_timer
+                    exit $?
+                    ;;
+                run|check|--run|--check)
+                    if [ -x "$REALM_HEALTHCHECK_SCRIPT" ]; then
+                        "$REALM_HEALTHCHECK_SCRIPT"
+                    else
+                        generate_realm_healthcheck_script | bash
+                    fi
+                    exit $?
+                    ;;
+                status|""|--status)
+                    show_realm_healthcheck_status
+                    exit 0
+                    ;;
+                *)
+                    echo -e "${COLOR_RED}未知 healthcheck 参数：$2${COLOR_RESET}"
+                    show_usage
+                    exit 1
+                    ;;
+            esac
             ;;
         help|--help|-h)
             show_usage
@@ -2027,6 +2559,22 @@ while true; do
                         ;;
                     4)
                         show_config
+                        wait_key
+                        ;;
+                    5)
+                        show_realm_healthcheck_status
+                        wait_key
+                        ;;
+                    6)
+                        install_realm_healthcheck_timer "enable-now"
+                        wait_key
+                        ;;
+                    7)
+                        disable_realm_healthcheck_timer
+                        wait_key
+                        ;;
+                    8)
+                        upgrade_realm_service_config "apply-now"
                         wait_key
                         ;;
                     0) break ;;
